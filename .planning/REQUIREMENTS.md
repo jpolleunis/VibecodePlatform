@@ -120,8 +120,38 @@ Phase 1 is alleen "done" wanneer **alle** v1 requirements `[x]` zijn én:
 
 ---
 
-## Traceability (filled by ROADMAP.md)
+## Traceability
 
 | REQ-ID | Phase | Notes |
 |--------|-------|-------|
-| (filled by gsd-roadmapper) | | |
+| AUTH-01 | 1 | SSO werkt op portal + 1 dummy ACA app |
+| AUTH-02 | 4 | Postgres-backed roles + RBAC middleware |
+| AUTH-03 | 1 | App-registration + manifest in repo |
+| INFRA-01 | 1 | Bicep skeleton + AVM modules |
+| INFRA-02 | 1 | Shared services Bicep-deployed |
+| INFRA-03 | 1 | Budget-alert €100 + €50 |
+| INFRA-04 | 1 | Naming + tagging convention |
+| INFRA-05 | 2 | Test+prod Container Apps voor pilot-app |
+| INFRA-06 | 1 | LAW daily-cap + AI sampling |
+| APP-01 | 2 | Meeting Agent static + Easy Auth |
+| APP-02 | 2 | Node Express proxy + KV ref |
+| APP-03 | 3 | Postgres-backed daily-cap + rate-limit |
+| APP-04 | 2 | Manual DevTools-check op secrets-leak |
+| PORTAL-01 | 4 | Next.js + Auth.js + tenant-pin |
+| PORTAL-02 | 4 | Dashboard reads DB + ACA API |
+| PORTAL-03 | 4 | Admin-pagina + RBAC |
+| PORTAL-04 | 5 | Append-only audit log |
+| CICD-01 | 5 | Path-triggered ADO pipelines |
+| CICD-02 | 5 | Trivy gate HIGH+ |
+| CICD-03 | 5 | promote.yml retag-only + portal trigger |
+| CICD-04 | 1 | WIF service connection |
+| SEC-01 | 1 | KV + MI + RBAC |
+| SEC-02 | 2 | CSP headers |
+| SEC-03 | 2 | HTTPS + cookies + Auth.js defaults |
+| SEC-04 | 5 | Secret-rotation in runbook |
+| SEC-05 | 1 | `/healthz/secrets` readiness |
+| DOC-01 | 6 | architecture.md polish |
+| DOC-02 | 5 (skelet) + 6 (polish) | runbook |
+| DOC-03 | 6 | onboarding shake-out |
+| DOC-04 | 1 | IT-request day 1 |
+| DOC-05 | 1 | README |
