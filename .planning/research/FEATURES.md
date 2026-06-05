@@ -1,8 +1,10 @@
 # Feature Research
 
 **Domain:** Internal "vibecoding" platform / mini-PaaS / internal app-launcher (TAG-internal Azure-hosted)
-**Researched:** 2026-05-19
-**Confidence:** HIGH (synthesis of strong prior knowledge on Vercel/Render/Railway/fly.io/Heroku/Backstage/Coolify/Dokploy + verification searches; matches PROJECT.md Active scope and constraints)
+**Researched:** 2026-05-19 — **revised 2026-05-30 (Sessie 2 scope reduction)**
+**Confidence:** HIGH for feature priorities; technology notes below were authored against the Sessie 1 stack — see banner.
+
+> ⚠️ **Sessie 2 banner.** This file documents the *feature priorities* (table stakes / differentiators / anti-features). They are still valid. The *technology notes* in the "Notes" column below were written against the Sessie 1 stack (Azure AD + Easy Auth + Next.js + Auth.js + Prisma + Postgres Flex + Key Vault + ACR). The authoritative current technology choices are in `research/STACK.md` and `research/ARCHITECTURE.md` — Container-Apps-only + self-host Keycloak + self-host Postgres + Python FastAPI portal/proxy. Read the technology hints below as "Sessie 1 history"; read REQUIREMENTS.md for the authoritative current REQ → tech mapping.
 
 ## Context Framing
 
