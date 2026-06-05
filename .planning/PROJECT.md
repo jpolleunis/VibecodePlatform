@@ -70,6 +70,7 @@ Een TAG-collega kan een "vibecoded" interne app gebruiken via een deelbare URL n
 - [ ] **DOC-04**: `docs/it-request.md` met exacte resources, rollen, quotas die TAG IT moet provisioneren (vereenvoudigd — alleen RG + ACA env + Storage Account + ADO).
 - [ ] **DOC-05**: Repo-`README.md` met 10-regel pitch, link naar PROJECT.md, link naar elk van DOC-01..04.
 - [ ] **DOC-06**: `docs/management.md` — management-facing architecture + user stories + timeline + Container-Apps-only kost.
+- [ ] **DOC-07**: `docs/app-developer-guide.md` — best-practices voor "vibecoders" (TAG-devs zonder ervaring): platform-contract, Claude Code + GSD + superpowers workflow, app-archetypes, anti-patronen.
 
 ### Out of Scope
 

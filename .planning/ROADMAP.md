@@ -21,7 +21,7 @@ Target: ~5.5 working weeks with 2 developers + Claude Code. Effective Azure cost
 **Goal**: Bicep-deploy vanaf nul levert lege RG met alle gedeelde Container Apps (Postgres, Keycloak, registry) + werkende SSO via Keycloak op lege portal-pagina.
 **Mode:** mvp
 **Depends on**: TAG IT request (RG + Storage + ACA Env quota + ADO project)
-**Requirements**: AUTH-01, KEYCLOAK-01, INFRA-01..06, PGSELF-01, REGISTRY-01, ACASECRETS-01, CICD-04, SEC-01, SEC-05, DOC-04, DOC-05, DOC-06
+**Requirements**: AUTH-01, KEYCLOAK-01, INFRA-01..06, PGSELF-01, REGISTRY-01, ACASECRETS-01, CICD-04, SEC-01, SEC-05, DOC-04, DOC-05, DOC-06, DOC-07 (draft)
 **Success Criteria**:
   1. `az deployment group create -f infra/main.bicep` slaagt vanaf lege RG in ≤ 30 min met 0 onverwachte changes bij re-run (`what-if`).
   2. ADO pipeline `infra.yml` draait via SP-secret service connection en deployt naar RG.
@@ -40,7 +40,7 @@ Plans:
 - [ ] 01-04: Self-host Docker registry Container App + `oauth2-proxy` sidecar config + Azure Files mount + registry GC job.
 - [ ] 01-05: Keycloak Container App + realm-export.json + clients + bootstrap-admin + `keycloak-realm-sync.yml` pipeline.
 - [ ] 01-06: Python FastAPI portal stub (login via Authlib + Keycloak) deployed to single Container App with ACA-secrets.
-- [ ] 01-07: Write `docs/it-request.md` + `README.md` + initial `docs/management.md` (timeline + cost-table).
+- [ ] 01-07: Write `docs/it-request.md` + `README.md` + initial `docs/management.md` (timeline + cost-table) + initial `docs/app-developer-guide.md` (platform-contract + workflow voor vibecoders).
 
 ### Phase 2: Meeting Agent Live behind SSO
 **Goal**: Pilot-app (Nginx static + Python FastAPI proxy) draait achter Keycloak via oauth2-proxy sidecar; gebruiker praat met Claude via server-side key uit ACA-secret.
@@ -122,7 +122,7 @@ Plans:
 **Goal**: Alle docs op productiekwaliteit; alle 10 DoD-checks aantoonbaar groen; tweede dev kan onboarden van clean machine.
 **Mode:** mvp
 **Depends on**: Phase 5
-**Requirements**: DOC-01, DOC-02 (polish), DOC-03, alle DoD-verificaties
+**Requirements**: DOC-01, DOC-02 (polish), DOC-03, DOC-07 (polish), alle DoD-verificaties
 **Success Criteria**:
   1. `docs/architecture.md` reflecteert geïmplementeerde realiteit.
   2. `docs/onboarding.md` is door tweede dev gevolgd van clean machine → lokaal draaien + test-deploy in ≤ 4 uur.

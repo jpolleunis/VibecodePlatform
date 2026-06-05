@@ -63,12 +63,14 @@
 - [ ] **DOC-04**: `docs/it-request.md` (vereenvoudigd: alleen RG, Storage Account, ACA Env quota, ADO org/project).
 - [ ] **DOC-05**: Repo-`README.md` met 10-regel pitch + links naar docs.
 - [ ] **DOC-06**: `docs/management.md` — management-facing architectuur, user stories, timeline, Container-Apps-only kost.
+- [ ] **DOC-07**: `docs/app-developer-guide.md` — best-practices-gids voor "vibecoders" (TAG-developers zonder ervaring) hoe ze apps bouwen voor dit platform. Beschrijft het platform-contract (port/healthz/secrets/OIDC-headers/stdout-JSON), de aanbevolen Claude Code + GSD + superpowers workflow, drie app-archetypes (statisch / statisch+AI / full backend), cheat-sheet voor skills, troubleshooting + anti-patronen.
 
 ---
 
 ## v2 Requirements (deferred to Phase 2)
 
 - **CUSTOM-DOMAIN-01**, **LOGS-IN-PORTAL-01**, **VIEWER-ROLE-01**, **COST-DASH-01**, **APP-REG-SELF-SVC-01**, **HEALTH-CHECK-01**, **ROLLBACK-BTN-01**, **MULTI-LLM-01**, **AUDIT-HARDEN-01**, **NIMBUS-DB-SYNC-01**, **TEAMS-NOTIFY-01**, **KEYCLOAK-MS-FED-01** (Microsoft-tenant federation in Keycloak)
+- **APP-TEMPLATE-01** — Geversioneerd `vibecoding-app-template`-repo met Dockerfile, healthz, OIDC-header parsing, structlog, pytest-skelet, voorbeeld-apps (static-ai, crud-app). Bootstrap-script (`./bootstrap.sh`) hernoemt + herzet git. Deze template is wat DOC-07 documenteert, maar levert pas in Phase 2.
 
 ---
 
@@ -148,3 +150,4 @@ Phase 1 is "done" wanneer **alle** v1 requirements `[x]` zijn én:
 | DOC-04 | 1 | IT-request day 1 |
 | DOC-05 | 1 | README |
 | DOC-06 | 1 | Management-facing MD |
+| DOC-07 | 1 (draft) + 6 (polish) | App-developer-gids voor vibecoders |
