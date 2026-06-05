@@ -1,381 +1,285 @@
-# PITFALLS — Internal App-Hosting Platform on Azure Container Apps
+# PITFALLS — Container-Apps-only + Self-host Python rebuild
 
 **Project:** vibecoding-platform
-**Researched:** 2026-05-30
-**Confidence:** MEDIUM-HIGH (HIGH for stack-specific gotchas; verification pass recommended before treating as final)
-
-> **Verification note.** Pitfalls below are grounded in well-known issues for this exact stack (ACA + Easy Auth + Auth.js v5 + Bicep + ADO + Anthropic). Run a follow-up Context7/WebSearch pass before locking pricing/version-specific numbers.
+**Researched:** 2026-05-30 (Sessie 2 — scope reduction)
+**Confidence:** MEDIUM-HIGH (HIGH for ACA + self-host gotchas; verification pass recommended before treating as final)
 
 ---
 
-## Critical Pitfalls (cause rewrites, outages, or budget blowups)
+## Critical Pitfalls
 
-### CRIT-1: ACA scale-to-zero kills your background workers and breaks the daily-spend cap
+### CRIT-1: ACA scale-to-zero kills your in-process daily-cap counter (unchanged)
 
 **Confidence:** HIGH
 
-**What goes wrong:** With `minReplicas: 0` on the LLM-proxy container, ACA scales the app to zero after the cooldown (default 300s of no HTTP traffic). The next request takes 3-15s cold start. Worse: any *in-process* counter for the $10/day Claude cap is wiped because the replica is destroyed. The new replica starts with `spent_today = 0`.
-
-**Consequences:**
-- First user of the morning hits a 5-15s spinner — looks like the platform is broken.
-- Daily-cap counter resets between scaler events — actual spend can be 2-3x the configured cap.
-- Background log-flushers, audit-writers, retry queues are killed mid-flight → silent data loss.
+**What goes wrong:** Same as in the Azure-heavy version. With `minReplicas: 0` on the LLM-proxy, ACA scales to zero, and any in-process counter for the $10/day cap resets on cold start.
 
 **Prevention:**
-1. **Daily-cap state MUST live outside the container** — put the counter in Postgres or Redis with `UPDATE ... RETURNING` for atomic decrement. Never in-memory.
-2. For the LLM-proxy specifically, set `minReplicas: 1` (one B-tier replica idle costs ~€8-12/month — within €100 budget and worth it for cap-correctness alone).
-3. For the Next.js portal, `minReplicas: 0` is fine if you accept cold start. Use a warmup ping only after Phase 1 ships.
-4. Add `terminationGracePeriodSeconds: 30` so in-flight requests drain.
-
-**Detection:** Spend reports exceed daily cap. App Insights `requests.duration` p95 > 3s on first request after idle window.
+1. **Daily-cap state MUST live in Postgres**, not in-process. `SELECT … FOR UPDATE` + 90% safety margin.
+2. LLM-proxy `minReplicas: 1` in both test and prod (one B-tier replica idle costs ~€2-3/month — well within the €30 budget).
+3. `terminationGracePeriodSeconds: 30` so in-flight requests drain.
 
 **Phase:** Phase 1 (LLM-proxy infra + cap-enforcement design).
 
 ---
 
-### CRIT-2: Daily-spend cap race condition across replicas amplifies cost during traffic spikes
+### CRIT-2: Daily-cap race condition across replicas (unchanged)
 
-**Confidence:** HIGH
+Same mitigation as in the original stack — `SELECT … FOR UPDATE` + cost-from-`usage` post-call + 90% safety margin. See ARCHITECTURE.md §5 for the transaction pattern.
 
-**What goes wrong:** Two replicas read `spent_today = $9.50`, both decide "I can take one more request" (each < $10 cap), both call Claude, both write $9.80. Cap was $10, actual spend is $10.10+ — and during burst, retries amplify this.
-
-**Prevention:**
-1. Use Postgres advisory lock or `SELECT ... FOR UPDATE` around cap check + decrement:
-   ```sql
-   BEGIN;
-   SELECT spent_cents FROM daily_cap WHERE day = CURRENT_DATE FOR UPDATE;
-   -- if spent + estimated_cost > cap then ROLLBACK and 429
-   UPDATE daily_cap SET spent_cents = spent_cents + actual_cost_cents WHERE day = CURRENT_DATE;
-   COMMIT;
-   ```
-2. **Account post-call from `usage` block in Anthropic response**, not pre-call estimate. `input_tokens` + `output_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens` all have different prices.
-3. Disable client retries on your own cap-breach 429; only retry on Anthropic-origin 429/529 with capped exponential backoff (max 2 retries, jitter).
-4. Reserve a safety margin — set the actual hard-stop at 90% of the configured cap.
-
-**Detection:** End-of-day reconciliation between cap-counter and Anthropic's usage API. Delta > 5% → locking is broken.
-
-**Phase:** Phase 1 (LLM-proxy daily-cap design — non-negotiable before any user can call Claude).
+**Phase:** Phase 1.
 
 ---
 
-### CRIT-3: Easy Auth redirect-URI mismatch on first Bicep deploy locks you out of the portal
+### CRIT-3: Self-host Postgres on Azure Files = file-locking surprises
 
 **Confidence:** HIGH
 
-**What goes wrong:** Bicep creates the Container App with a generated FQDN like `portal--abc123.<region>.azurecontainerapps.io`, but the Entra ID app-registration's redirect URI was hardcoded. Easy Auth refuses login: `AADSTS50011: The redirect URI ... does not match`.
+**What goes wrong:** Azure Files (SMB) doesn't honor every `fsync`/`flock` semantic that Postgres assumes. Result: occasional WAL corruption on restart, very slow checkpoint writes, or "could not write to relation X" errors under load. This is a well-documented sharp edge of running Postgres on SMB-mounted volumes.
 
-**Why it happens:**
-- ACA appends a random suffix unless you pre-create the environment + custom domain.
-- `/.auth/login/aad/callback` is the Easy Auth callback path — Auth.js v5 uses `/api/auth/callback/microsoft-entra-id` instead. Mixing them is the #1 issue.
-- Bicep deploys the app-registration and the container app in parallel — redirect URI is set with a placeholder.
+**Consequences:**
+- Random WAL corruption requiring restore.
+- Sustained query latency 5-20× higher than local disk.
+- Postgres refuses to start if it detects stale lock file from a previous run.
 
 **Prevention:**
-1. **Decide upfront: Easy Auth OR Auth.js per surface, not both on the same surface.** For pilot-apps with no per-user state: Easy Auth. For the portal with per-user roles + audit: Auth.js v5. Document the split clearly.
-2. If Easy Auth: register **both** redirect URIs during transition: `https://<aca-fqdn>/.auth/login/aad/callback` and (later) `https://<custom-domain>/.auth/login/aad/callback`.
-3. Set `accessTokenAcceptedVersion: 2` on the app-registration manifest. Set Easy Auth `allowedTokenAudiences` to include the exact `api://<client-id>` (case-sensitive, no trailing slash).
-4. Bicep ordering: create the ACA environment + custom-domain binding before the app-registration redirect URIs. Use `dependsOn` explicitly.
-5. Smoke test in pipeline: `curl -I https://portal/...` returns 302 to `login.microsoftonline.com` — fail the deploy if not.
+1. **Use Azure Files Premium (NFS-backed)** for the `pg-data` share, not Standard SMB. ~€7/month for the minimum 100 GiB quota — still cheaper than managed Postgres.
+2. If Standard MUST be used, mount with `nobrl,noserverino,actimeo=0` and set Postgres `wal_sync_method=fsync` (explicit, don't rely on default).
+3. **Nightly pg_dump to second share is mandatory**, not optional. 14-day retention.
+4. **Restore drill in Phase 1 DoD** — corrupt pg-data share, restore from latest dump, confirm portal works within 1 hour.
+5. Use the external Python recovery platform (user's existing tooling) as a second safety net for catastrophic loss.
 
-**Detection:** `AADSTS50011`, `AADSTS50013`, `AADSTS700016` in App Insights traces. Browser network tab shows infinite redirect loop.
-
-**Phase:** Phase 1 (auth setup, before any container is deployed).
+**Phase:** Phase 1 (Postgres infra setup).
 
 ---
 
-### CRIT-4: Workload Identity Federation 401s from RG-scope misconfiguration
+### CRIT-4: Keycloak realm config not persisted = login broken after restart
 
 **Confidence:** HIGH
 
-**What goes wrong:** ADO service connection uses WIF with subject claim `sc://<org>/<project>/<service-connection-name>`. Federated credential on the user-assigned MI is at subscription level, but RBAC (Contributor) is at RG level. Pipeline gets a token, then `az deployment group create` returns 401/403. The federated credential `issuer` mismatch gives a misleading "no permission" error.
+**What goes wrong:** Keycloak stores its realm/users/clients in the Postgres DB. If `JAVA_OPTS` or `KC_DB_*` env vars are misconfigured, Keycloak boots with an in-memory H2 dev DB. Restart = all users + clients lost. Worse: silent — login still seems to work briefly with whatever was bootstrapped.
+
+**Consequences:**
+- On every container restart, all role assignments + audit go away.
+- Even worse if production users were added manually — gone with no recovery.
 
 **Prevention:**
-1. **One MI per environment** (dev, prod), not per pipeline. Reduces federated-credential churn (20-credential limit).
-2. RBAC at **resource-group scope** matching your Bicep deployment scope. If `targetScope = 'subscription'`, RBAC must be at subscription level.
-3. Subject claim exact format: `sc://<org-name>/<project-name>/<service-connection-name>` — verify with `az identity federated-credential show`.
-4. First pipeline step: `az account show` and `az group list --query "[?name=='<rg>']"`. If empty, fail fast.
-5. Document the WIF setup as a runbook (6 steps; nobody remembers it after 3 months).
+1. **Always set `KC_DB=postgres` + `KC_DB_URL` + `KC_DB_USERNAME` + `KC_DB_PASSWORD`** explicitly. Never rely on defaults.
+2. **Realm-export checked into git** (`infra/keycloak/realm-export.json`). Pipeline `keycloak-realm-sync.yml` applies it on every deploy via `kcadm.sh`.
+3. Boot Keycloak with `kc.sh start --optimized` only after first warm-up build (`kc.sh build`) — both must run with the same DB env vars.
+4. Smoke test in `infra.yml` pipeline: `curl https://keycloak…/realms/vibecoding/.well-known/openid-configuration` returns 200 with `issuer` matching expected URL.
+5. Bootstrap admin password in ACA-secret; rotate after first login.
 
-**Detection:** `AADSTS70021: No matching federated identity record found`. `AuthorizationFailed` on deployment.
+**Detection:** Keycloak logs `Using H2 database` on boot. `/realms/master` returns instead of `/realms/vibecoding`.
 
-**Phase:** Phase 1 (CI/CD bootstrap, day 1-2).
+**Phase:** Phase 1 (Keycloak setup, before any other auth).
 
 ---
 
-### CRIT-5: Key Vault references on ACA fail silently at cold start
+### CRIT-5: Self-host Docker registry exposes images publicly if oauth2-proxy is bypassed
 
 **Confidence:** HIGH
 
-**What goes wrong:** ACA resolves Key Vault references at **container start time**, not at revision-create time. If MI doesn't have `Key Vault Secrets User` RBAC yet (Bicep order or RBAC propagation lag), the container starts, env var is *empty string*, and the app crashes with a confusing "missing config" error — not "Key Vault access denied".
+**What goes wrong:** `distribution/distribution:3` listens on `:5000` with no auth by default. ACA ingress maps that to public HTTPS. Without `oauth2-proxy` sidecar in front, anyone with the URL can `docker pull` any image. With it in front but misconfigured (wrong upstream port, missing `--reverse-proxy=true`), the Docker CLI flow breaks — devs disable auth in frustration.
+
+**Consequences:**
+- Internal images leaked publicly (source code / secrets baked in images).
+- Or: no one can pull, builds fail, devs disable security.
 
 **Prevention:**
-1. **Use RBAC, not access-policies.** Set `enableRbacAuthorization: true` on the KV resource and use `Key Vault Secrets User` role.
-2. Bicep: explicit `dependsOn` from the Container App to the RBAC assignment. Add a deploy-time `deploymentScript` that polls `az containerapp show` until the revision is `Running`, retrying revision-create if needed.
-3. For secret rotation, include secret version in the revision suffix so a new version forces a new revision automatically.
-4. Add a `/healthz/secrets` endpoint that returns 503 if any required secret is empty/missing — surfaces the issue in the readiness probe, preventing traffic split to a broken revision.
+1. **oauth2-proxy sidecar pattern**: oauth2-proxy on port `4180` is the only ingress target; it proxies to `localhost:5000` (registry) after auth. Bicep ingress points to `4180`.
+2. Set `OAUTH2_PROXY_SKIP_AUTH_REGEX = ^/v2/$` (Docker pings unauthenticated `/v2/` for capability discovery).
+3. Set `OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER=true` + `OAUTH2_PROXY_REVERSE_PROXY=true` for `docker login` flow with bearer-tokens.
+4. **Test from a clean machine**: `docker login <registry-url>` should redirect to Keycloak; anonymous `curl -X GET <registry-url>/v2/_catalog` should return 401.
+5. Disable v1 registry API entirely (`distribution/distribution:3` already does, but verify).
 
-**Detection:** App Insights: 500 errors immediately after deploy, env-var dump shows secrets as empty. ACA logs: `secret 'X' not found in keyvault`.
-
-**Phase:** Phase 1 (KV + ACA wiring).
+**Phase:** Phase 1 (registry setup).
 
 ---
 
-### CRIT-6: Log Analytics ingest cost blows past €100/month budget alert in week 1
+### CRIT-6: ACA `secrets:` have no rotation tooling — manual procedure required
 
 **Confidence:** HIGH
 
-**What goes wrong:** Default ACA log collection sends every stdout/stderr line to Log Analytics. A chatty Next.js dev build emits 50-200 lines per request. ContainerAppConsoleLogs + ContainerAppSystemLogs + Postgres slow-query log + App Insights default 100% sampling = €60-150/month easily from logs alone.
+**What goes wrong:** ACA `secrets:` are revision-scoped — updating a secret value does NOT update existing revisions. Apps continue using the old value until a new revision is created. Without a documented procedure, secrets get "rotated" but apps keep using the old value silently.
 
 **Prevention:**
-1. Set Log Analytics **daily cap** at 1 GB/day (LAW → Usage and estimated costs → Daily cap). Hard ceiling.
-2. App Insights `samplingPercentage: 20` for dev, `5` for prod LLM-proxy. Adaptive sampling on.
-3. Postgres: `log_min_duration_statement = 1000` (log only queries > 1s). Don't log all statements.
-4. ACA: route only `ContainerAppConsoleLogs` to LAW. Send `ContainerAppSystemLogs` to a Storage Account.
-5. **30-day retention** (default 90) for LAW.
-6. Add a cost-alert at €50 (50% of budget) in addition to €100 — gives a week to react.
+1. **Document in `docs/runbook.md`:** "To rotate secret X: (a) update Bicep `secrets:` value or pipeline-variable, (b) run `az containerapp update` with `--set-env-vars` to force new revision, (c) verify via `az containerapp revision list`."
+2. Use **pipeline variables** for rotatable secrets (Anthropic key, SP-secret) so rotation = pipeline run; immutable secrets (Keycloak admin password) stay in Bicep.
+3. **`/healthz/secrets` endpoint** on portal + proxy returns 503 if any required secret is empty/missing or test-validates as expired — surfaces a failed rotation in readiness probe.
+4. Bicep-managed secrets: changing the value in `.bicepparam` and re-deploying creates a new revision automatically (`identifier`-based revisions).
 
-**Detection:** Cost Management → "Log Analytics workspace" line item > €30/month. LAW Usage chart > 500 MB/day.
+**Phase:** Phase 1 (KV-equivalent setup), runbook in Phase 5.
 
-**Phase:** Phase 1 (infra-bicep — must be set before first container starts emitting).
+---
+
+### CRIT-7: Log Analytics ingest from chatty Python apps blows the budget alert
+
+**Confidence:** HIGH
+
+**Same risk class as the original** — but now Python `structlog` JSON is the source. Default Python loggers + uvicorn access logs emit 5-50 lines per request.
+
+**Prevention:**
+1. LAW **daily cap 500 MB** (lower than original 1 GB).
+2. `structlog` JSON renderer; **drop noisy keys** before emit.
+3. Uvicorn: `--no-access-log` in production; rely on FastAPI middleware to log only error+warn paths.
+4. Postgres: `log_min_duration_statement = 1000`.
+5. Cost-alert at €15 (50% of €30 budget) in addition to €30.
+
+**Phase:** Phase 1.
 
 ---
 
 ## High-Impact Pitfalls
 
-### HIGH-1: ACA ingress revision-mode "Single" vs "Multiple" confusion blocks blue/green
+### HIGH-1: ACA revision-mode confusion (unchanged)
 
-**What goes wrong:** Default `activeRevisionsMode: 'Single'` — every new revision instantly takes 100% traffic. Devs want blue/green but think they have it because they see two revisions.
-
-**Prevention:**
-- Phase 1: stick with `Single`. Simpler, matches "ship fast".
-- Phase 2+ blue/green: `activeRevisionsMode: 'Multiple'` **and** set `trafficWeights` explicitly. Bicep gotcha: omitting `trafficWeights` in Multiple mode = 0% to all revisions = downtime.
-- Always pin `revisionSuffix` (e.g., git short SHA) so revisions are predictable.
-
-**Phase:** Phase 1 (decide mode); Phase 2+ (implement blue/green).
+Default `Single` revision mode is fine for Phase 1; for blue/green move to `Multiple` with explicit `trafficWeights`. Same advice as before.
 
 ---
 
-### HIGH-2: Auth.js v5 + Entra ID — `trustHost`, session strategy, Edge runtime mistakes
+### HIGH-2: Python image bloat balloons self-host registry storage
 
-**What goes wrong (multi-part):**
-1. Behind ACA's reverse proxy, `AUTH_URL` (renamed from `NEXTAUTH_URL` in v5) must match the public URL exactly. → "URL mismatch".
-2. v5 requires `trustHost: true` when behind a proxy (Vercel auto-detects, ACA does not). Without it: `UntrustedHost` error.
-3. Default session strategy is `jwt` — fine for SSO. For server-side revocation: `database` strategy + Prisma adapter on Postgres.
-4. Provider id is `microsoft-entra-id`, not `azure-ad` (renamed in v5). Old tutorials are wrong.
-5. Edge runtime middleware can't use the database adapter — JWT-only there.
-6. `tenantId` must be the actual tenant GUID for single-tenant apps, NOT `common` or `organizations` (those allow any tenant — security hole).
+**What goes wrong:** `python:3.12` is ~120 MB; `python:3.12-slim` is ~50 MB. With 50 builds/dev/week + no retention, registry storage on Azure Files fills up.
 
 **Prevention:**
-1. Hardcode `AUTH_URL` per environment in KV.
-2. `trustHost: true` in `auth.ts` config.
-3. `provider: 'microsoft-entra-id'` with `tenantId: process.env.AZURE_TENANT_ID` explicitly.
-4. JWT sessions for Phase 1; move to DB sessions only when force-logout-on-revoke is needed.
-5. Middleware check: `if (token.tid !== process.env.AZURE_TENANT_ID) return 403` — defense in depth.
+1. Multi-stage Dockerfiles; final image uses `python:3.12-slim` + only runtime deps.
+2. Registry retention: registry garbage-collect job (`registry garbage-collect /etc/docker/registry/config.yml`) runs weekly via ACA Job.
+3. Image-tagging discipline: `git-sha` tags immutable; `latest` mutable alias only.
+4. Trivy multi-stage scan: only the final stage.
 
-**Phase:** Phase 1 (portal auth setup).
+**Phase:** Phase 1 (Dockerfile design + retention job).
 
 ---
 
-### HIGH-3: Bicep + AVM module version drift causes "works on my machine" deploys
+### HIGH-3: Keycloak realm-export drift between staging and prod
 
-**What goes wrong:**
-- AVM modules pulled from `br/public:avm/res/...` without pinned version → next deploy gets a new minor with breaking parameter changes.
-- AVM module idempotency: re-running a deploy can delete properties not specified (ARM PUT semantics) — e.g., re-deploying ACA wipes manual diagnostic settings added in the portal.
+**What goes wrong:** Admins click in the Keycloak admin UI to make changes; those changes don't end up in `realm-export.json` in git. Next pipeline run overwrites the live config with the stale checked-in version → lost role assignments + user accounts.
 
 **Prevention:**
-1. **Always pin AVM version**: `module foo 'br/public:avm/res/app/container-app:0.11.0' = { ... }`. Never `:latest` or omit.
-2. Renovate-bot or quarterly review for AVM updates — read CHANGELOG before bumping.
-3. Never click-ops in the portal for resources managed by Bicep. Bicep = single source of truth.
-4. Use `az deployment group what-if` in CI before every deploy. Fail pipeline if unexpected deletes appear.
+1. **One-way sync only**: pipeline applies `realm-export.json` to Keycloak. Never the reverse.
+2. Admin UI access disabled in production (Keycloak `--features-disabled=admin-ui` or restricted via Keycloak role).
+3. All realm changes go via PR editing `realm-export.json` + `kcadm.sh` validation in CI.
+4. Keycloak users data (passwords etc.) lives in Postgres — exported separately if needed; not in `realm-export.json`.
 
-**Phase:** Phase 1 (Bicep skeleton); ongoing.
+**Phase:** Phase 1 (Keycloak setup).
 
 ---
 
-### HIGH-4: ACR + Trivy scanning produces false-fail noise from base-image CVEs
+### HIGH-4: Python startup time + cold starts (FastAPI)
 
-**What goes wrong:** Trivy scans every layer including the Node base. `node:20-alpine` has 10-30 medium CVEs at any time, mostly in OS packages you don't use. Pipeline fails on every push → devs disable scanning → real CVEs slip through.
+**What goes wrong:** Python FastAPI cold-start is 2-5s (vs Node ~0.5s). Combined with ACA scale-to-zero (which we keep on for static + registry), some endpoints feel slow first-touch.
 
 **Prevention:**
-1. `--severity HIGH,CRITICAL` only for fail condition. Report MEDIUM and below to a dashboard, don't fail.
-2. `--ignore-unfixed` — nothing actionable about CVEs with no patch.
-3. `.trivyignore` for known-acceptable CVEs with expiry date (force review every 90 days).
-4. Use distroless or `node:20-slim` as base — smaller attack surface.
-5. Trivy in `image` mode against the built image, not the Dockerfile.
+1. Portal and LLM-proxy: `minReplicas: 1`. Cost-acceptable.
+2. Pre-warm Python via `uvicorn --workers 1` + lazy-load Anthropic SDK only on first request.
+3. Use `--app-dir` + skip auto-reload.
+4. For scale-to-zero apps (static + registry): cold-start measured but acceptable (< 3s).
 
-**Phase:** Phase 1 (CI setup); revisit baselines monthly.
+**Phase:** Phase 1.
 
 ---
 
-### HIGH-5: Postgres Flex B1ms — CPU credits and connection cap exhaustion
+### HIGH-5: ACA Job scheduling reliability for nightly pg_dump
 
-**What goes wrong:**
-- B1ms is **burstable**: 20% baseline CPU credit accumulation. Sustained > 20% CPU drains credits in ~30 min, then performance collapses to baseline → 5-10x slower queries.
-- B1ms `max_connections` default: ~85. Next.js + Auth.js + LLM-proxy + audit-log writers easily exhaust this.
+**What goes wrong:** ACA Jobs run on cron — if the cron expression is off (timezone confusion), or if the previous run was still running, the new run skips silently. pg_dump-job not running for a week = no backups.
 
 **Prevention:**
-1. **Add pgbouncer from day 1** — either Azure's built-in (`pgbouncer.enabled = true` Bicep param on Flex) or sidecar. Pool mode `transaction`.
-2. App side: singleton DB-pool per process, max 5 connections per replica. 2 replicas of portal + 2 of LLM-proxy = 20 connections; under 85.
-3. Monitor `cpu_credit_balance` — alert at < 200 remaining.
-4. Upgrade trigger: as soon as Phase 2 hits, jump to D2ds_v5 (~€60/month). Don't run prod on burstable beyond MVP.
-5. `idle_in_transaction_session_timeout = 30000` (30s) to kill leaked connections.
+1. Cron expression in UTC, verify with `crontab.guru`.
+2. Job sets `replicaTimeout: 1800` (30 min max) and `replicaRetryLimit: 1`.
+3. **Job last-run audit row** written to `portal.audit_log` by the job itself; portal dashboard shows "last backup: X hours ago" with red badge if > 36h.
+4. Alert rule in Azure Monitor on ACA Job `replicaFailures` > 0.
 
-**Detection:** `SELECT count(*) FROM pg_stat_activity` consistently > 60. Query p95 latency suddenly 5x without traffic change = CPU credits depleted.
-
-**Phase:** Phase 1 (DB setup); upgrade trigger Phase 2.
+**Phase:** Phase 1.
 
 ---
 
-### HIGH-6: CSP headers break Claude-generated artifacts that use inline scripts
+### HIGH-6: CSP for Claude artifacts (unchanged)
 
-**Confidence:** MEDIUM
+Same as before — Claude artifacts often use inline `<script>`. Sandbox the artifact viewer in an iframe on a distinct subdomain with relaxed CSP, or strip server-side.
 
-**What goes wrong:** Sensible CSP (`script-src 'self'`) blocks inline `<script>` in Claude-generated HTML artifacts. The artifact viewer shows a blank page. Devs add `'unsafe-inline'` everywhere → XSS protection gone.
-
-**Prevention:**
-1. **Sandbox the artifact viewer in an iframe** with `sandbox="allow-scripts"` and a **distinct origin** (e.g., `artifacts.vibecoding.tag-team.be` vs `portal.vibecoding.tag-team.be`). Artifact subdomain can have looser CSP because same-origin policy contains damage.
-2. Strip `<script>` server-side if the artifact must render in the portal origin (DOMPurify with strict allowlist).
-3. Portal: nonce-based CSP via middleware. Auth.js v5 docs cover this pattern.
-4. Never `'unsafe-eval'` on the portal origin — Next.js doesn't need it in production.
-
-**Phase:** Phase 2 (artifact viewer); CSP baseline in Phase 1.
+**Phase:** Phase 2 (artifact viewer); CSP baseline in Phase 1 for the static-app served via Nginx.
 
 ---
 
 ## Moderate Pitfalls
 
-### MOD-1: Audit log integrity — admins can edit Postgres rows
+### MOD-1: Audit log integrity (unchanged)
 
-**Prevention:**
-1. **Append-only at DB level**: revoke `UPDATE` and `DELETE` from the app role on the audit table. Only `INSERT` and `SELECT`.
-2. Hash-chain rows: `prev_hash = sha256(prev_row.serialized + prev_row.prev_hash)`. Tampering breaks the chain.
-3. Periodic export to **immutable Azure Storage** (Blob with `immutabilityPolicy` + legal hold). <€1/month.
-4. DBA access via JIT (PIM) only, with mandatory ticket reference.
-
-**Phase:** Phase 1 (basic append-only). Hash chain + immutable export → Phase 2.
+Append-only at DB level (revoke `UPDATE`, `DELETE` on app role). Hash-chain rows in Phase 2.
 
 ---
 
-### MOD-2: ACA replica idle billing — `minReplicas:1` × N apps × 24h is real money
+### MOD-2: ACA replica idle billing scaled down
 
-**Prevention:**
-- `minReplicas: 1` ONLY for: LLM-proxy (cap-state consistency) and portal (UX).
-- Internal/admin tools: `minReplicas: 0`, accept cold start.
-- Use **Consumption workload profile**, not Dedicated, until multiple high-traffic apps exist.
-- CPU/memory at the minimum that passes the readiness probe — most Node apps run fine on 0.25 vCPU / 0.5 GiB.
+**Now-relevant counts:** portal + proxy + Postgres + Keycloak = 4 always-on replicas × ~€3 each = €12 idle compute baseline. Plus scale-to-zero apps. Total ~€15-20 net.
 
-**Phase:** Phase 1 (per-app sizing decision).
+**Prevention:** sizing per ARCHITECTURE.md; resist `minReplicas: 1` for non-stateful apps.
 
 ---
 
-### MOD-3: ACR Basic SKU storage limit (10 GB) — image bloat from Next.js
+### MOD-3: Anthropic prompt-token accounting (unchanged)
 
-**Prevention:**
-1. **Multi-stage Dockerfile**: `output: 'standalone'` in `next.config.js`. Final image 150-300 MB.
-2. ACR retention policy: delete untagged manifests after 7 days. `az acr config retention`.
-3. Tag with git SHA + `latest`. Untag old SHAs after deploy succeeds.
-
-**Phase:** Phase 1 (Dockerfile design + retention policy).
+Use the full `usage` block from Anthropic responses: `input + output + cache_creation + cache_read` with current pricing.
 
 ---
 
-### MOD-4: Anthropic prompt-token vs completion-token vs cache-token accounting
+### MOD-4: Anthropic 529 retry storms (unchanged)
 
-**Prevention:**
-1. Full pricing formula from `usage` response:
-   `cost = input × $3/MTok + output × $15/MTok + cache_creation × $3.75/MTok + cache_read × $0.30/MTok` (Sonnet 4 rates — verify current).
-2. Store the raw `usage` object in the audit table — recalculate cost at end-of-day for reconciliation.
-3. Pin the model in code (`claude-sonnet-4-...`) — pricing differs by model.
-
-**Phase:** Phase 1 (LLM-proxy implementation).
+Exponential backoff with jitter via `tenacity`. Max 2 retries. Circuit breaker on 5 consecutive 529s.
 
 ---
 
-### MOD-5: Anthropic 529 (overloaded) retry storms
+### MOD-5: SP-secret rotation procedure missed
+
+**What goes wrong:** ADO service connection uses a Service Principal client-secret. Default expiry 12 months. Without rotation reminder, deploys fail one day with "AADSTS7000222: The provided client secret keys are expired".
 
 **Prevention:**
-1. Exponential backoff with **jitter**: `delay = random(0, base * 2^attempt)`.
-2. Max 2 retries total. After that, return 503 with "Claude is busy, try again".
-3. Circuit breaker: 5 consecutive 529s in 1 min → stop calling Anthropic for 2 min.
-4. Idempotency keys: pass `anthropic-idempotency-key` header when supported.
+1. SP-secret expiry 90 days; calendar reminder + audit-log row "SP-secret rotated by X on Y".
+2. Rotation procedure in `docs/runbook.md`: create new secret → update ADO service connection → run dummy pipeline → revoke old secret.
+3. Optional: Phase 2 migrate to WIF after first proven Phase 1 run.
 
-**Phase:** Phase 1 (LLM-proxy retry policy).
-
----
-
-### MOD-6: Custom domain + managed cert provisioning timing
-
-**Confidence:** MEDIUM
-
-**What goes wrong:** ACA managed certificates require DNS CNAME + TXT validation. Provisioning takes 10-30 min. First deploy: Bicep "succeeds" but HTTPS returns cert error for 20 min.
-
-**Prevention:**
-1. Pre-create the custom domain binding **once, manually**, the day before first prod deploy. Cert provisioning is idempotent.
-2. Document in runbook: "managed cert can take 30 min on first bind — wait, don't redeploy".
-3. For dev environment, use the default ACA FQDN — skip custom domain.
-
-**Phase:** Phase 1.5+ (custom domain not in Phase 1 scope).
+**Phase:** Phase 1 (initial SP creation); rotation procedure in Phase 5.
 
 ---
 
 ## Minor Pitfalls
 
-### MIN-1: Next.js 15 App Router — `cookies()` / `headers()` are now async
+### MIN-1: Azure Files SMB quota auto-grow
 
-Next.js 15 made `cookies()`, `headers()`, `draftMode()` async. Auth.js v5 examples on the web are mixed. Sync usage shows deprecation in dev, **runtime error in prod**. Always `await` them.
-
-**Phase:** Phase 1 (any server-component using auth).
+Standard Files default share quota = 5 TiB; provisioned tier is what costs money. Ensure `quota: 100` (GiB) on the share — not 5120.
 
 ---
 
-### MIN-2: Bicep parameter file (`.bicepparam`) vs JSON parameter file confusion
+### MIN-2: Keycloak version pin
 
-`.bicepparam` is newer (2023+), supports KV references and expressions. `.parameters.json` is legacy. Pick `.bicepparam`, delete the rest.
-
-**Phase:** Phase 1 (Bicep skeleton).
+`quay.io/keycloak/keycloak:26` pulls latest 26.x. Pin to `:26.0.x` exact.
 
 ---
 
-### MIN-3: Time zone in audit logs — UTC vs Europe/Brussels
+### MIN-3: `distribution/distribution:3` config
 
-Postgres `timestamp without time zone` + app inserting local time = ambiguous audit logs (especially across DST). Use `timestamptz` always. Display in Brussels TZ in the portal, store in UTC.
-
-**Phase:** Phase 1 (schema design).
+Default config file uses `inmemory` storage driver. Override with `filesystem` driver pointing to mounted volume — else images vanish on restart.
 
 ---
 
-### MIN-4: Next.js standalone output forgets `public/` and `.next/static`
+### MIN-4: Python `slowapi` keying
 
-`output: 'standalone'` only copies server code. Must manually `COPY --from=build /app/public ./public` and `COPY --from=build /app/.next/static ./.next/static` in the Dockerfile, or static assets 404 in production.
-
-**Phase:** Phase 1 (Dockerfile).
+`slowapi` defaults to keying on IP. We want per-user keying. Use a custom `key_func` reading the Keycloak `sub` from the validated JWT.
 
 ---
 
-### MIN-5: ADO Service Connection scoping — too broad
+### MIN-5: Postgres connection-limit at low resource sizing
 
-By default, the WIF service connection is granted Contributor on the **subscription**. Scope to the RG only. Use a separate service connection per environment (dev/prod) for least privilege.
+`postgres:16-alpine` default `max_connections = 100`. With portal + 2 proxies (test+prod) + Keycloak + admin sessions, this is tight. Either bump to 200 in postgres.conf or add pgbouncer container. Recommended: pgbouncer container (`edoburu/pgbouncer:latest`) in transaction-pool mode.
 
-**Phase:** Phase 1 (CI setup).
+**Phase:** Phase 1 (Postgres bootstrap).
 
 ---
 
-## Anti-Recommendations (skip these multi-tenant SaaS patterns)
+## Anti-Recommendations (skip)
 
-Internal, single-tenant platform — skip these despite their popularity in SaaS blogs:
-
-| Pattern | Why skip |
-|---------|---------|
-| Row-Level Security (RLS) for tenant isolation | Single tenant. Schema-per-app at most. |
-| Stripe-style metered billing | Internal users. Just track usage for chargeback Excel report. |
-| Multi-region deployment | One Belgian team. Single region (West Europe). |
-| `organizations` or `common` issuer in Entra | Single tenant — pin tenantId. `common` is a security regression. |
-| Per-tenant Key Vault | One KV per environment is plenty. |
-| Public-facing rate limiting (Cloudflare, etc.) | Behind Easy Auth. No anonymous traffic. |
-| Sophisticated feature flags (LaunchDarkly) | 2 devs, 1 product. Env-var booleans suffice. |
-| OpenTelemetry export to third-party APM | App Insights covers it. €30+/month for nothing. |
-| Public status page (statuspage.io) | Internal — Teams channel suffices. |
-| GDPR data-residency complexity | Internal employee data, EU tenant. Standard West Europe deployment satisfies. |
-| CAPTCHA / bot protection | Behind SSO. No anonymous access. |
+Same as before. Internal, single-tenant. Skip RLS, multi-region, statuspage, etc.
 
 ---
 
@@ -383,22 +287,21 @@ Internal, single-tenant platform — skip these despite their popularity in SaaS
 
 | Phase Topic | Critical Pitfalls Active | Mitigation Owner |
 |-------------|--------------------------|------------------|
-| Phase 1 — Auth bootstrap | CRIT-3, HIGH-2, MIN-1 | Dev A |
-| Phase 1 — Infra Bicep | CRIT-5, HIGH-3, CRIT-6, MOD-2 | Dev B |
-| Phase 1 — CI/CD WIF | CRIT-4, MIN-5, HIGH-4 | Dev A |
-| Phase 1 — LLM-proxy + daily cap | CRIT-1, CRIT-2, MOD-4, MOD-5 | Dev B |
-| Phase 1 — Postgres | HIGH-5, MOD-1, MIN-3 | Dev A |
-| Phase 1 — Docker/ACR | MOD-3, MIN-4 | Dev B |
-| Phase 2 — Artifact viewer | HIGH-6 | TBD |
-| Phase 2 — Audit hardening | MOD-1 (hash chain + immutable export) | TBD |
+| Phase 1 — Bicep + ACA Env + Storage | CRIT-3 (Azure Files for Postgres), CRIT-7 (LAW ingest) | Dev B |
+| Phase 1 — Postgres + pg_dump | CRIT-3, HIGH-5 (job reliability), MIN-5 (connection-limit) | Dev A |
+| Phase 1 — Keycloak | CRIT-4 (DB persistence), HIGH-3 (realm drift), MIN-2 (version pin) | Dev A |
+| Phase 1 — Self-host registry | CRIT-5 (oauth2-proxy bypass), HIGH-2 (image bloat), MIN-3 (filesystem driver) | Dev B |
+| Phase 1 — LLM-proxy + cap | CRIT-1, CRIT-2, MOD-3, MOD-4 | Dev B |
+| Phase 1 — Secrets via ACA | CRIT-6 (no rotation tooling) | Dev A |
+| Phase 1 — Python apps | HIGH-4 (cold start), MIN-4 (slowapi keying) | Dev A |
+| Phase 5 — CI/CD | MOD-5 (SP-secret rotation) | Dev A |
+| Phase 2 — Artifact viewer | HIGH-6 (CSP/inline scripts) | TBD |
 
 ---
 
 ## Recommendations for the Roadmap
 
-1. **Treat CRIT-1/CRIT-2/CRIT-3 as Phase 1 blockers** — no production traffic until each is verified.
-2. **Re-run a verification pass** before Phase 1 starts to lock down:
-   - Current Anthropic pricing for Sonnet 4 (CRIT-2, MOD-4)
-   - AVM `avm/res/app/container-app` latest version + breaking changes (HIGH-3)
-   - Auth.js v5 stable release status (HIGH-2)
-3. **Pre-deploy smoke tests in pipeline** for every CRIT pitfall — `/healthz/secrets`, redirect-302 check, `az account show`, `pg_stat_activity` count.
+1. Treat CRIT-1/CRIT-2/CRIT-3/CRIT-4 as Phase 1 blockers — no production traffic until each is verified.
+2. Postgres-on-Azure-Files-Premium decision **before** Phase 1 day 1 — if Standard chosen, plan for slower queries.
+3. **Restore drill in DoD** — corrupting the pg-data share and restoring from dump must be exercised at least once.
+4. Pre-deploy smoke tests in pipeline for every CRIT — `/healthz/secrets`, registry-anon-401, Keycloak well-known, daily-cap-transaction.

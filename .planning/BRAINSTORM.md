@@ -211,3 +211,61 @@ The downstream artifacts that build on this trail:
 ---
 
 *Captured at the end of the brainstorming session, before requirements + roadmap generation.*
+
+---
+
+# Sessie 2 — Scope reduction (2026-05-30, na initieel project-blad)
+
+User reviewde de gegenereerde PROJECT/REQUIREMENTS/ROADMAP en gaf een nieuwe richtlijn:
+
+> *"Liefst zo weinig mogelijk Azure, enkel Container Apps, voor de rest toch zoveel zelf proberen bouwen in Python of Java. Maak ook een md-file met een duidelijke uitleg over de architectuur en opbouw van het platform zonder te veel in technische details te treden met wat user stories dat we kunnen presenteren bij het management (met timeline en kost (geen developperskosten, enkel Container Apps kost)"*
+
+Doel: minimale Azure-vendor lock-in + lagere kost + management-pitch.
+
+## Q&A (plan-mode, 4 vragen)
+
+### Q1 — Taal voor self-built services?
+**A — Python (FastAPI).** Snellere MVP, kleinere images, beste Anthropic-SDK-fit.
+
+### Q2 — Database: hoe ver Azure-managed vermijden?
+**A (freeform):** *"We hebben een ander platform waar we dataverliezen kunnen fiksen in python"*
+→ Geïnterpreteerd als: self-host Postgres in Container App is OK; data-loss-recovery via TAG's externe Python-platform (Nimbus-achtig) als safety-net. Nightly `pg_dump` mandatory.
+
+### Q3 — SSO / auth?
+**A — Self-hosted Keycloak in Container App.** Postgres-backed, OIDC, realm-export in git, optioneel Microsoft-federation in Phase 2.
+
+### Q4 — Container Registry?
+**A — Self-hosted Docker registry in Container App.** `distribution/distribution:3` + `oauth2-proxy` sidecar voor OIDC-auth.
+
+## Beslissingen vastgelegd
+
+| Onderwerp | Was (Sessie 1) | Wordt (Sessie 2) |
+|-----------|----------------|------------------|
+| Portal | Next.js 15 + Auth.js v5 + Prisma | Python 3.12 + FastAPI + Jinja2 + HTMX + SQLAlchemy 2 + Authlib |
+| Pilot-app proxy | Node Express + Anthropic SDK (JS) | Python FastAPI + Anthropic SDK |
+| Database | Azure DB for Postgres Flex (B1ms) | Self-host `postgres:16-alpine` Container App + Azure Files Premium mount + nightly pg_dump |
+| SSO | Azure AD app-registration + Easy Auth + Auth.js Entra ID provider | Self-host Keycloak 26 + `oauth2-proxy` sidecar (statics/registry) + Authlib (portal/proxy) |
+| Container Registry | Azure Container Registry Basic | Self-host `distribution/distribution:3` + Azure Files |
+| Secrets | Azure Key Vault + Managed Identity | Container Apps built-in `secrets:` |
+| Observability | Log Analytics + Application Insights | Log Analytics + `structlog` JSON (no App Insights) |
+| IaC | Bicep + AVM modules (pinned) | Bicep single-file (no AVM) |
+| ADO → Azure auth | Workload Identity Federation | Service Principal client-secret (90d rotation) |
+| Documentatie | DOC-01..05 | DOC-01..06 (DOC-06 = management.md) |
+| Timeline target | ~2 weken | ~5.5 weken (eerlijk gezien self-host scope) |
+| Budget target | €100/maand Azure | €30/maand alert; ~€10-15 effectief |
+
+## Push-back samenvatting
+
+Claude flagde dat zelfgebouwde login in Sessie 1 een security-risico was; daar bleef de pushback bij Azure AD. Nu in Sessie 2 wordt het auth-werk verplaatst naar Keycloak (open-source, battle-tested), wat een verdedigbare middenweg is: geen Azure AD-licentie, geen zelfgebouwde wachtwoord-flow.
+
+Ook eerlijk gemaakt: timeline schoof van 2 weken naar ~5.5 weken; self-host adds work. Management-pitch krijgt deze cijfers transparant.
+
+## Downstream impact
+
+Alle planning-documenten worden in één refactor-commit aangepast: `PROJECT.md`, `REQUIREMENTS.md`, `ROADMAP.md`, `STATE.md`, `research/STACK.md`, `research/ARCHITECTURE.md`, `research/PITFALLS.md`, `research/SUMMARY.md`, `CLAUDE.md` (regenereren), en het nieuwe `docs/management.md`.
+
+`research/FEATURES.md` blijft conceptueel correct (features veranderden niet, alleen technologie) — niet aangepast.
+
+---
+
+*Sessie 2 trail captured immediately after the plan was approved, before the rework commit.*

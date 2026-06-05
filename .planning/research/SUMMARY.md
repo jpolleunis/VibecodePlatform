@@ -1,135 +1,106 @@
-# Research SUMMARY — VibeCoding Platform
+# Research SUMMARY — VibeCoding Platform (Container-Apps-only)
 
 **Synthesizes:** STACK.md + FEATURES.md + ARCHITECTURE.md + PITFALLS.md
-**Date:** 2026-05-30
+**Date:** 2026-05-30 (Sessie 2 — scope reduction)
 
 ---
 
 ## TL;DR
 
-The stack in PROJECT.md is **fundamentally correct** with five non-obvious corrections (logged below). The 20 Phase-1 features map 1:1 to PROJECT.md Active items — no gaps, no fluff. Six critical pitfalls **must be mitigated in Phase 1** or production traffic will burn money or break security. Phase 1 is feasible in ~2 weeks for 2 devs + Claude Code provided the TAG IT request lands on day 1.
+Azure-surface is reduced to **Container Apps + Storage + Log Analytics**. Everything else is self-hosted: **Postgres + Keycloak + Docker registry** as Container Apps with Azure Files volumes, and the portal + LLM-proxy are rebuilt in **Python (FastAPI)**. Effective monthly Azure cost target ~€10-15. Phase 1 timeline realistic at ~5.5 weeks for 2 devs + Claude Code.
+
+The 28 v1 requirements still cover the same product surface; what changed is the *technology choices*, not the *outcomes*.
 
 ---
 
-## Stack — final picks
+## Stack — final picks (Sessie 2)
 
-| Layer | Pick | Version (May 2026) |
-|-------|------|---------------------|
-| Hosting | Azure Container Apps, single Env, suffix-naming for test/prod | API `2026-01-01` |
-| Portal | Next.js (App Router) + TS + Tailwind + shadcn/ui + Prisma | 15.2.x LTS / 5.6+ / v4 / latest / 6.19.x |
-| Portal auth | Auth.js v5 with **`microsoft-entra-id` provider** (not legacy Azure AD) | 5.0 |
-| Pilot-app auth | Container Apps **Easy Auth** (Entra ID) | n/a |
-| Pilot-app proxy | Node 22 LTS + Express 4 + `@anthropic-ai/sdk` | 4.21.x / 0.97.x |
-| Rate-limit & daily cap | `rate-limiter-flexible` with Postgres store (`express-rate-limit` is in-memory only — won't survive replica restarts) | 5.x |
-| DB | Postgres Flex B1ms + **pgbouncer ON** | 16 |
-| Registry | ACR Basic | n/a |
-| Secrets | Key Vault, RBAC (not access-policies), Managed Identity | n/a |
-| IaC | Bicep + **Azure Verified Modules** (`br/public:avm/...`), version-pinned | Bicep CLI 0.31+ |
-| CI/CD | Azure DevOps Pipelines, **Workload Identity Federation** (no SP secrets) | n/a |
-| Image scan | Trivy `--severity HIGH,CRITICAL --ignore-unfixed` | 0.58+ |
-| Observability | Log Analytics workspace **+ Application Insights** (workspace-based) | n/a |
-| Dep updates | **Renovate Bot** (Dependabot-on-ADO needs paid GHAS) | n/a |
-| LLM | Anthropic Claude API direct | Sonnet 4 |
-
-**Five corrections vs. original PROJECT.md notes:**
-1. `MicrosoftEntraIDProvider`, not legacy `AzureADProvider` in Auth.js v5.
-2. Add Application Insights (PROJECT.md only mentioned Log Analytics).
-3. Use WIF for ADO → Azure (replaces long-lived service principal secret).
-4. Use AVM modules (classic ALZ-Bicep retired 16 Feb 2026).
-5. Daily-spend cap **must be Postgres-backed**, not in-memory (`express-rate-limit` is per-process).
+| Layer | Pick |
+|-------|------|
+| Hosting | Azure Container Apps (Consumption), single Env, suffix-naming |
+| Storage | Azure Storage Account + Files (Premium for pg-data, Standard for others) |
+| Logs | Azure Log Analytics workspace, daily-cap 500 MB |
+| IaC | Bicep single-file (no AVM) |
+| Portal | Python 3.12 + FastAPI + Jinja2 + HTMX + SQLAlchemy 2 (async) + Authlib |
+| Pilot-app proxy | Python 3.12 + FastAPI + `anthropic` SDK + `slowapi` + `tenacity` + `structlog` |
+| Pilot-app static | Nginx + `oauth2-proxy` sidecar |
+| Database | Self-host `postgres:16-alpine` Container App + Azure Files Premium mount + pg_dump nightly ACA Job |
+| SSO | Self-host `quay.io/keycloak/keycloak:26` Container App, Postgres-backed, realm-export in git |
+| Container Registry | Self-host `distribution/distribution:3` Container App + `oauth2-proxy` sidecar + Azure Files mount |
+| Secrets | Container Apps built-in `secrets:` |
+| Image scan | Trivy `--severity HIGH,CRITICAL --ignore-unfixed` |
+| CI/CD | Azure DevOps Pipelines + Service Principal client-secret service connection (90d rotation) |
+| LLM | Anthropic Claude API direct |
 
 ---
 
-## Feature priorities
+## What was dropped vs Sessie 1
 
-**Phase 1 — 20 P1 features**, all map 1:1 to PROJECT.md Active list:
-- Auth (3): AUTH-01..03
-- Infra (5): INFRA-01..05
-- Pilot app (4): APP-01..04
-- Portal (4): PORTAL-01..04
-- CI/CD (3): CICD-01..03
-- Security (4): SEC-01..04
-- Documentation (5): DOC-01..05 — **first-class P1, not afterthought**
-
-**Phase 2 candidates** (deferred but signposted): custom domain → app-owner field + share button → health-check display → portal-rendered logs → Teams notifications → self-service app registration → multi-LLM abstraction → rollback button.
-
-**12 anti-features** explicitly to NOT build in Phase 1:
-- UI-upload of Dockerfiles (RCE risk)
-- Custom domain
-- Multi-LLM-provider abstraction (3× proxy code, zero pilot value)
-- Self-hosting Coolify/Dokploy instead of ACA
-- Per-PR preview deploys (Vercel-style)
-- Backstage Software Catalog (right for ~25 apps, not 1)
-- Stripe-style metered billing
-- RLS / multi-tenant isolation patterns
-- Public status page
-- LaunchDarkly / sophisticated feature flags
-- OpenTelemetry export to third-party APM
-- CAPTCHA / bot protection
+Azure DB for PostgreSQL Flex, Azure Key Vault, Azure Container Registry, Azure AD app-registration, Container Apps Easy Auth, Application Insights, Workload Identity Federation, Azure Verified Modules, Next.js, Auth.js, Prisma.
 
 ---
 
-## Architecture decisions locked (see ARCHITECTURE.md §13)
+## Architecture decisions locked (ARCHITECTURE.md §11)
 
-- **A1.** Single Container Apps Environment, suffix-naming for test/prod.
-- **A2.** Single Entra app-registration, app-roles `Admin` + `Developer`.
-- **A3.** Source of truth for roles = Postgres `app_users` (seeded from Entra claim on first login).
-- **A4.** Easy Auth for pilot static + proxy; Auth.js v5 for portal.
-- **A5.** Daily cap counter = Postgres `SELECT … FOR UPDATE` + 90% safety margin.
-- **A6.** Promote = ACR retag (same digest), never rebuild.
+- **A1.** Single Container Apps Environment, suffix-naming.
+- **A2.** Single Keycloak realm `vibecoding`, two clients (`portal` + `meeting-agent-proxy`), two roles (`Admin`, `Developer`).
+- **A3.** Source of truth for roles = Postgres `portal.app_users` (seeded from Keycloak role-claim).
+- **A4.** `oauth2-proxy` sidecar in front of static + registry; Authlib OIDC in portal + proxy.
+- **A5.** Daily-cap = Postgres `SELECT … FOR UPDATE` + 90% safety margin.
+- **A6.** Promote = retag in self-host registry (same digest).
 - **A7.** Monorepo + path-triggered ADO pipelines.
-- **A8.** WIF for ADO → Azure.
-- **A9.** Public ingress, no VNET in Phase 1.
-- **A10.** App Insights workspace-based, sampling (20% dev / 5% proxy prod).
+- **A8.** SP-secret service connection, 90-day rotation.
+- **A9.** Public ingress, no VNET.
+- **A10.** structlog JSON to ACA stdout, no App Insights.
 
 ---
 
 ## Pitfalls that drive Phase 1 design
 
-**Six critical** — must be mitigated before any user traffic:
+**Seven critical** — must be mitigated before any user traffic:
 
 | # | Risk | Phase-1 mitigation |
-|---|------|---------------------|
-| CRIT-1 | ACA scale-to-zero kills in-memory cap counter | `minReplicas: 1` on LLM-proxy; cap state in Postgres |
+|---|------|--------------------|
+| CRIT-1 | ACA scale-to-zero kills cap counter | `minReplicas: 1` on LLM-proxy; cap state in Postgres |
 | CRIT-2 | Daily-cap race condition across replicas | `SELECT … FOR UPDATE` + 90% safety margin |
-| CRIT-3 | Easy Auth redirect-URI mismatch locks devs out | Decide Easy Auth vs Auth.js per-surface upfront; v2 audience; pre-bind redirect URIs in Bicep with `dependsOn` |
-| CRIT-4 | WIF 401s from scope mismatch | One MI per environment; RBAC at RG-scope matching Bicep target scope; exact subject-claim format |
-| CRIT-5 | Key Vault refs fail silently at container cold start | RBAC (not access-policies); explicit Bicep `dependsOn`; `/healthz/secrets` readiness probe |
-| CRIT-6 | Log Analytics ingest blows €100/month in week 1 | LAW daily cap 1 GB; App Insights sampling 20%/5%; cost alert at €50 + €100 |
+| CRIT-3 | Self-host Postgres on Azure Files = file-locking bugs | Azure Files **Premium** for pg-data; nightly pg_dump; restore drill in DoD |
+| CRIT-4 | Keycloak realm config lost on restart | `KC_DB=postgres` explicit; realm-export in git; pipeline applies it |
+| CRIT-5 | Self-host registry leaks images if oauth2-proxy misconfigured | Sidecar pattern with strict `OAUTH2_PROXY_*` config; anon-401 smoke test |
+| CRIT-6 | ACA `secrets:` have no rotation tooling | Documented procedure: pipeline-variable + revision-bump |
+| CRIT-7 | Log Analytics ingest blows €30 budget | LAW daily cap 500 MB + structlog renderer + uvicorn --no-access-log |
 
-**Six high-impact** (HIGH-1..6): revision-mode confusion, Auth.js v5 `trustHost`/Edge runtime gotchas, AVM version drift, Trivy false-fail noise, Postgres B1ms credit/connection exhaustion, CSP-vs-inline-scripts in Claude artifacts.
+**Six high-impact** (HIGH-1..6): revision-mode confusion, Python image bloat on registry, Keycloak realm drift between UI and git, Python cold-start, ACA Job reliability for pg_dump, CSP-vs-inline-scripts in Claude artifacts.
 
-**Five Next.js-specific minors** (MIN-1..5): async `cookies()`/`headers()`, `.bicepparam` vs `.parameters.json`, `timestamptz` for audit, standalone-output forgets `public/`, WIF service-connection scoped too broad by default.
+**Five minors** (MIN-1..5): Azure Files quota, Keycloak version pin, distribution filesystem driver, slowapi key-func, Postgres connection-limit.
 
 ---
 
-## Build order (from ARCHITECTURE.md §9)
+## Build order (ARCHITECTURE.md §8)
 
-1. Bicep skeleton (RG, KV empty, LAW, AI, ACR, ACA Env)
-2. Entra app-reg + WIF service connection
-3. Postgres Flex + pgbouncer + initial schema
-4. Portal stub (login only) + Easy Auth on dummy app — **validates SSO contract**
+1. Bicep skeleton (RG, Storage Account + Files shares, LAW, ACA Env)
+2. Self-host registry + oauth2-proxy + Keycloak realm-export checked-in
+3. Self-host Postgres + pg_dump ACA Job + restore-drill validated
+4. Portal stub (login-only) wired to Keycloak via Authlib
 5a + 5b (parallel). Portal real features ← + → LLM-proxy + daily-cap
-6. Meeting Agent static (Nginx) + wire to proxy
+6. Meeting Agent static (Nginx) + oauth2-proxy sidecar
 7. All ADO pipelines path-triggered + Trivy + smoke tests
-8. Docs (DOC-01..05)
+8. Docs (DOC-01..06)
 9. Promote-test→prod pipeline + portal trigger + audit
 
-Steps 5a + 5b are explicitly parallel — two developers, one each.
+---
+
+## Open verification items (before Phase 1 starts)
+
+- Anthropic Sonnet 4 current pricing.
+- ACA Consumption pricing + free-tier numbers for May 2026.
+- Keycloak 26 boot flow on Container Apps (`kc.sh start --optimized`).
+- `distribution/distribution:3` Docker-OIDC auth via `oauth2-proxy` (test end-to-end before committing pattern).
+- Azure Files Premium vs Standard for pg-data — Premium recommended for performance; verify minimum quota cost (~€7/100 GiB).
 
 ---
 
-## Open verification items (re-check before Phase 1 starts)
+## Cost summary
 
-- Current Anthropic Sonnet 4 pricing (affects CRIT-2 and MOD-4 numbers).
-- Latest AVM `avm/res/app/container-app` version + breaking-change CHANGELOG (HIGH-3).
-- TAG IT decision: GHAS-on-ADO yes/no (determines Dependabot vs Renovate).
-- TAG IT decision: Defender for Cloud subscription state (affects whether ACR scanning replaces Trivy or augments it).
+Target: ~€10-15/month effective Azure cost after free-tier (~€16-20 gross), ~€120-180/year. See `docs/management.md` for the public-facing breakdown.
 
----
-
-## Roadmap implications
-
-- **Phase structure** maps to build order in §9 above. Granularity "standard" (5-8 phases) per config: likely Phase 1 = single milestone, decomposed into ~6 phases (Foundation, Auth, Data, Portal, Pilot App, Promotion+Docs).
-- **Critical-path dependency: TAG IT request.** File day 1; without RG + WIF + app-reg the 2-week timeline collapses. IT-request checklist (DOC-04) is therefore the highest-leverage doc in Phase 1.
-- **Documentation is in scope from day 1** (DOC-01..05). Code without docs = not "done".
+Trade-off: more dev work (~5.5 week timeline instead of 2) + ops burden (Postgres backups, Keycloak realm sync, registry GC) in exchange for cost + portability.

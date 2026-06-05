@@ -1,8 +1,8 @@
-# ARCHITECTURE — Internal App-Hosting Platform on Azure Container Apps
+# ARCHITECTURE — Container-Apps-only + Python rebuild
 
 **Project:** vibecoding-platform
-**Researched:** 2026-05-30
-**Confidence:** HIGH — synthesized from STACK.md decisions, FEATURES.md scope, and standard Azure Container Apps architectural patterns. Verified against Microsoft Learn.
+**Researched:** 2026-05-30 (Sessie 2 — scope reduction)
+**Confidence:** HIGH
 
 ---
 
@@ -10,226 +10,195 @@
 
 ```mermaid
 flowchart TB
-  subgraph Browser
-    user[TAG colleague]
+  user[TAG colleague<br/>browser]
+
+  subgraph ACAEnv["Azure Container Apps Environment (Consumption, West Europe)"]
+    portal["portal<br/>(Python FastAPI + Jinja2 + HTMX)<br/>minReplicas: 1"]
+    pilot_static["meeting-agent-static-{test,prod}<br/>(Nginx + oauth2-proxy sidecar)"]
+    pilot_proxy["meeting-agent-proxy-{test,prod}<br/>(Python FastAPI + Anthropic SDK)<br/>minReplicas: 1"]
+    keycloak["keycloak<br/>(quay.io/keycloak/keycloak:26)<br/>minReplicas: 1"]
+    pgdb["postgres<br/>(postgres:16-alpine)<br/>minReplicas: 1"]
+    registry["docker-registry<br/>(distribution/distribution:3 + oauth2-proxy)<br/>scale-to-zero"]
+    pgdump["pg-backup-job<br/>(ACA Job, daily)"]
   end
 
-  subgraph AzureAD["Microsoft Entra ID (TAG tenant)"]
-    app_reg["App registration<br/>vibecoding-platform"]
+  subgraph Storage["Azure Storage Account (Files Standard LRS)"]
+    pgvol[(pg-data share)]
+    kcvol[(keycloak-data share)]
+    regvol[(registry-data share)]
+    backupvol[(pg-backups share, 14d retention)]
   end
 
-  subgraph ACAEnv["Azure Container Apps Environment<br/>cae-vibecoding-pilot (West Europe)"]
-    portal["portal<br/>(Next.js 15 + Auth.js v5)<br/>1 instance"]
-    pilot_static["meeting-agent-static-{test,prod}<br/>(Nginx + Easy Auth)"]
-    pilot_proxy["meeting-agent-proxy-{test,prod}<br/>(Node Express + Easy Auth)"]
-  end
+  law["Log Analytics workspace<br/>(daily cap 500MB)"]
+  ado["Azure DevOps<br/>Repos + Pipelines"]
+  anthropic["Anthropic Claude API"]
 
-  subgraph DataPlane["Data plane"]
-    pg["Azure DB for PostgreSQL<br/>Flex Server B1ms (single)"]
-    kv["Azure Key Vault<br/>(RBAC, MI-only)"]
-    acr["Azure Container Registry<br/>Basic SKU"]
-  end
+  user -->|HTTPS + OIDC redirect| portal
+  user -->|HTTPS + OIDC redirect| pilot_static
+  portal -->|OIDC| keycloak
+  pilot_static -->|OIDC via sidecar| keycloak
+  pilot_static -->|fetch /api/llm same-origin| pilot_proxy
+  pilot_proxy -->|JWT validation| keycloak
+  pilot_proxy -->|HTTPS + x-api-key| anthropic
 
-  subgraph Obs["Observability"]
-    law["Log Analytics workspace"]
-    ai["Application Insights<br/>(workspace-based)"]
-  end
+  portal --> pgdb
+  pilot_proxy --> pgdb
+  keycloak --> pgdb
 
-  subgraph CICD["Azure DevOps"]
-    ado_repo["Repos<br/>(monorepo)"]
-    ado_pipe["Pipelines<br/>+ WIF service connection"]
-  end
+  pgdb --- pgvol
+  keycloak --- kcvol
+  registry --- regvol
+  pgdump --- pgvol
+  pgdump --- backupvol
 
-  user -->|HTTPS + AAD SSO| portal
-  user -->|HTTPS + AAD SSO via Easy Auth| pilot_static
-  pilot_static -->|fetch /api/llm<br/>session cookie| pilot_proxy
-  pilot_proxy -->|HTTPS<br/>x-api-key header| anthropic["Anthropic Claude API"]
+  ado -->|az containerapp update<br/>image=<registry-url>| ACAEnv
+  ado -->|docker push| registry
 
-  portal -->|MI| pg
-  pilot_proxy -->|MI| pg
-  pilot_proxy -->|MI: read claude-api-key| kv
-  portal -->|MI: read auth-secret| kv
-
-  portal -.->|/.auth| app_reg
-  pilot_static -.->|/.auth/login/aad| app_reg
-
-  ado_pipe -->|WIF token| acr
-  ado_pipe -->|WIF token| ACAEnv
-  ado_repo --> ado_pipe
-
-  ACAEnv -.->|stdout/stderr| law
-  ACAEnv -.->|telemetry| ai
-  pg -.->|slow-query log| law
+  ACAEnv -.->|stdout JSON| law
 ```
 
 ---
 
 ## 2. Component Inventory
 
-| Component | Purpose | Tech | Phase-1 size |
-|-----------|---------|------|--------------|
-| **Portal** | Login, app list, role admin, audit view, promote trigger | Next.js 15 + Auth.js v5 + Prisma + Tailwind + shadcn/ui | 1 Container App (Consumption), `minReplicas: 0`, `maxReplicas: 2`, 0.5 vCPU / 1 GiB |
-| **Meeting Agent — static** | Serves the Claude-generated HTML/JS artifact | Nginx (alpine) + Container Apps Easy Auth | 2 Container Apps (test, prod). Test: 0.25 vCPU / 0.5 GiB, scale-to-zero. Prod: 0.5 vCPU / 1 GiB, `minReplicas: 1` |
-| **Meeting Agent — LLM proxy** | Single `/api/llm` endpoint. Enforces per-user rate-limit + Postgres-backed daily cap. Calls Anthropic API. | Node 22 LTS + Express 5 + `@anthropic-ai/sdk` + `rate-limiter-flexible` (PG store) | 2 Container Apps (test, prod). Both `minReplicas: 1` (cap-state correctness — see PITFALLS CRIT-1) |
-| **Postgres** | Portal data (apps, users-with-roles, audit_log), LLM-proxy daily-cap counters, rate-limiter store | Azure DB for PostgreSQL Flexible Server B1ms, pgbouncer ON, single instance | 1 DB server, 4 logical DBs: `portal`, `proxy_meeting_agent_test`, `proxy_meeting_agent_prod`, `_admin` |
-| **Key Vault** | Secrets: `claude-api-key`, `auth-secret` (Auth.js), DB passwords (per-app role) | Azure Key Vault, RBAC enabled | 1 KV |
-| **ACR** | Container images for all apps | Azure Container Registry, Basic SKU, retention policy 7d for untagged | 1 registry |
-| **Log Analytics + App Insights** | Logs, traces, alerts, dashboards | Workspace-based App Insights, daily-cap 1 GB | 1 LAW |
-| **Azure AD app-registration** | Single app-reg for portal + pilot apps. Audience v2. App-roles: `Admin`, `Developer`. | Entra ID | 1 app-reg, 1 client-secret OR none if WIF only |
-| **ADO Repos + Pipelines** | Monorepo + path-triggered pipelines per artifact | Azure DevOps Services | 1 org, 1 project, ~5 pipelines |
+| Component | Purpose | Image / Lang | Phase-1 size |
+|-----------|---------|--------------|--------------|
+| **Portal** | Login, app list, role admin, audit view, promote trigger | `python:3.12-slim` + FastAPI + Jinja2 + HTMX | 0.5 vCPU / 1 GiB, `minReplicas: 1` |
+| **Meeting Agent — static** | Serves Claude artifact HTML/JS | `nginx:1.27-alpine` + `oauth2-proxy:7.6` sidecar | test: 0.25/0.5 scale-to-zero, prod: 0.5/1 minR1 |
+| **Meeting Agent — LLM proxy** | `POST /api/llm`. Postgres-backed daily cap + per-user rate-limit. Calls Anthropic. | `python:3.12-slim` + FastAPI + `anthropic` SDK | 0.25/0.5 both `minReplicas: 1` (cap-state correctness) |
+| **Keycloak** | OIDC SSO | `quay.io/keycloak/keycloak:26` | 0.5/1, `minReplicas: 1`. Realm export in `infra/keycloak/realm-export.json`. |
+| **Postgres** | Single DB server. Schemas: `portal`, `proxy_meeting_agent_test`, `proxy_meeting_agent_prod`, `keycloak`. | `postgres:16-alpine` | 0.5/1, `minReplicas: 1`. `/var/lib/postgresql/data` on Azure Files mount. |
+| **Docker Registry** | Self-hosted image registry | `distribution/distribution:3` + `oauth2-proxy:7.6` sidecar | 0.25/0.5, scale-to-zero. `/var/lib/registry` on Azure Files. |
+| **pg-backup job** | Container Apps Job, daily cron, dumps to second Azure Files share | `postgres:16-alpine` (uses `pg_dump`) | Scheduled, 14d retention on backups share. |
+| **Storage Account + Azure Files** | Persistent volumes | Standard LRS | ~10 GiB total across 4 shares |
+| **Log Analytics** | Log sink (required by ACA Env) | — | Daily cap 500 MB, 30d retention |
+| **ADO Repos + Pipelines** | Monorepo + path-triggered pipelines per artifact + SP-secret service connection | — | 1 org, 1 project, ~5 pipelines |
 
 ---
 
-## 3. Trust + Identity Boundaries
+## 3. Trust + Identity Flow
 
 ```
 TAG colleague
-  │  (Azure AD SSO — Entra ID, tenant-pinned, v2 tokens)
+  │  HTTPS to *.azurecontainerapps.io
   ▼
 ┌──────────────────────────────────────────────────────────────┐
-│              Container Apps Environment                      │
+│                Container Apps Environment                    │
 │                                                              │
-│   ┌──────────────┐                ┌──────────────────────┐   │
-│   │ portal       │                │ meeting-agent-static │   │
-│   │ Auth.js v5   │                │ Easy Auth (AAD)      │   │
-│   │ JWT session  │                │ (no app code)        │   │
-│   └─────┬────────┘                └──────────┬───────────┘   │
-│         │ session cookie                     │ session cookie│
-│         │                                    │ + same-origin │
-│         │                                    ▼               │
-│         │                    ┌─────────────────────────┐     │
-│         │                    │ meeting-agent-proxy     │     │
-│         │                    │ validates Easy Auth     │     │
-│         │                    │ header `x-ms-client-..` │     │
-│         │                    └────┬────────────────────┘     │
-│         │                         │                          │
-│         └────┐         ┌──────────┘                          │
-│              ▼         ▼                                     │
-│      ┌───────────────────┐    ┌────────────────────┐         │
-│      │ Postgres          │    │ Key Vault          │         │
-│      │ via MI (AAD-auth) │    │ via MI (RBAC)      │         │
-│      └───────────────────┘    └────────────────────┘         │
+│   ┌──────────────────┐    ┌────────────────────────────┐     │
+│   │ portal           │    │ meeting-agent-static       │     │
+│   │ Authlib OIDC     │    │ oauth2-proxy sidecar (OIDC)│     │
+│   │ session cookie   │    │ session cookie + JWT       │     │
+│   └────────┬─────────┘    └────────┬───────────────────┘     │
+│            │                       │                         │
+│            │ (server-side          │ fetch /api/llm          │
+│            │  Authlib redirect)    │ same-origin             │
+│            ▼                       ▼                         │
+│   ┌──────────────────┐    ┌────────────────────────────┐     │
+│   │ keycloak         │◄───┤ meeting-agent-proxy        │     │
+│   │ (OIDC issuer)    │    │ validates Keycloak JWT     │     │
+│   └────────┬─────────┘    └────────┬───────────────────┘     │
+│            │                       │                         │
+│            ▼                       ▼                         │
+│       ┌─────────────────────────────────┐                    │
+│       │ self-host postgres (multi-schema)│                    │
+│       │ portal | proxy_* | keycloak     │                    │
+│       └─────────────────────────────────┘                    │
 └──────────────────────────────────────────────────────────────┘
                                   │
-                                  ▼
-                       Anthropic Claude API (only proxy talks)
+                                  ▼  (proxy only)
+                       Anthropic Claude API
 ```
 
 **Rules:**
 
-- **Only the LLM-proxy ever holds the Claude API key**, fetched at startup via MI from Key Vault.
-- **The static artifact never receives the Claude key**, period — pilot-app fetches `/api/llm` same-origin; the proxy holds and uses the key.
-- **MI is system-assigned per Container App** for least-privilege RBAC on KV and Postgres.
-- **One Entra app-registration** for both portal and pilot apps; differentiation via app-roles (`Admin`, `Developer`) checked in portal code, and via Easy Auth's `x-ms-client-principal` header in the proxy.
+- **Only the LLM-proxy holds the Anthropic key**, injected via Container Apps `secrets:` env-var.
+- **Static artifact never receives any key** — fetches `/api/llm` same-origin; proxy validates Keycloak JWT then calls Anthropic.
+- **Single Keycloak realm `vibecoding`** with two clients (`portal` public client + PKCE; `meeting-agent-proxy` confidential client OR JWT validation by issuer-key). Two roles: `Admin`, `Developer`.
+- **Postgres is the only stateful store**; one server, multiple schemas. Connection strings differ per app via ACA-secret.
 
 ---
 
-## 4. Easy Auth ↔ Auth.js v5 — who handles auth where
+## 4. Auth flow detail
 
-| Surface | Auth mechanism | Why |
-|---------|---------------|-----|
-| **Portal** (`portal.vibecoding…`) | Auth.js v5 with `microsoft-entra-id` provider, JWT session, `trustHost: true` | Portal needs per-user role lookup from Postgres + audit logging + role-based UI. Auth.js gives flexible session + DB adapter path. |
-| **Meeting-agent-static** (`meeting-agent-{test,prod}.vibecoding…`) | Container Apps **Easy Auth** (Entra ID) | Static artifact has no server code. Easy Auth wraps Nginx with zero-code SSO. Eliminates a whole class of pilot-app auth bugs. |
-| **Meeting-agent-proxy** (same hostname as static, different path) | Easy Auth (inherited from same Container App if co-deployed) **OR** session cookie passed from static side if separate Container Apps | Proxy must know *which user* called it (for per-user rate-limit + audit). Both options pass the user identity via the `x-ms-client-principal` HTTP header. |
+### 4.1 Portal login
 
-**Single app-registration vs split:** Use **one** app-registration named `vibecoding-platform` with two redirect URIs:
-1. `https://portal…/api/auth/callback/microsoft-entra-id` (Auth.js callback)
-2. `https://meeting-agent-test…/.auth/login/aad/callback` and prod equivalent (Easy Auth callback)
+1. Browser → `portal…/dashboard` → portal middleware sees no session cookie → 302 to Keycloak `/realms/vibecoding/protocol/openid-connect/auth?...`
+2. Keycloak authenticates user (lokale Keycloak-DB; in Phase 2 federated naar TAG Microsoft tenant)
+3. Redirect back to `portal…/auth/callback` with code → Authlib exchanges for tokens → sets session cookie (httpOnly, secure, sameSite=lax)
+4. Portal middleware extracts `sub` + `realm_access.roles`, queries Postgres `app_users` for canonical role
+5. Dashboard renders
 
-Single app-reg simplifies role-management (app-roles defined once, checked by both portal and proxy) and avoids consent-screen duplication for users.
+### 4.2 User uses Meeting Agent
 
-**Roles model:**
+1. Browser → `meeting-agent-prod…/` → `oauth2-proxy` sidecar (port 4180) intercepts → 302 to Keycloak
+2. After login → oauth2-proxy sets session cookie → forwards to Nginx (port 80) which serves static
+3. Static page calls `fetch('/api/llm', ...)` same-origin (cookie sent)
+4. ACA ingress routes `/api/llm` to `meeting-agent-proxy` Container App
+5. Proxy validates JWT in cookie against Keycloak public key (cached + refreshed every 5 min)
+6. Proxy does Postgres `BEGIN; SELECT ... FOR UPDATE; UPDATE; COMMIT;` daily-cap dance
+7. Proxy calls Anthropic, returns response, audits `llm_calls` row
 
-- Entra ID app-roles `Admin` and `Developer` are defined in the app-registration manifest.
-- TAG IT (or admin in portal-DB after first login) assigns roles to users.
-- **Source of truth for roles in Phase 1 = Postgres `app_users` table.** Entra app-roles claim is checked on first login for bootstrap, then DB is authoritative.
-- Decision logged: `Authoritative role store = Postgres` (move to Entra-groups-only in Phase 2 if TAG IT prefers).
-
----
-
-## 5. Data flows
-
-### 5.1 User logs into the portal
-
-1. Browser → `portal.vibecoding…/dashboard` → 302 (Auth.js middleware) → `login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize`
-2. User selects Microsoft account → consent (if first-time) → redirected back to `portal…/api/auth/callback/microsoft-entra-id` with auth code
-3. Auth.js exchanges code → ID token + access token → JWT session cookie set
-4. Portal middleware on every request: `if (token.tid !== AZURE_TENANT_ID) return 403`
-5. Portal queries Postgres `app_users WHERE upn = token.preferred_username` for role
-6. Dashboard renders
-
-### 5.2 User uses Meeting Agent
-
-1. Browser → `meeting-agent-prod…/` → Easy Auth 302 → AAD login → callback → cookie set
-2. Static page loads
-3. Page calls `fetch('/api/llm', { method: 'POST', body: { prompt } })` same-origin (session cookie included)
-4. Easy Auth verifies cookie, injects `x-ms-client-principal` header containing user UPN
-5. Express LLM-proxy:
-   - Reads UPN from header
-   - Postgres transaction: `SELECT ... FOR UPDATE` on `daily_cap WHERE day = CURRENT_DATE`
-   - Checks per-user rate-limit (`rate-limiter-flexible` Postgres store)
-   - If under cap → calls Anthropic API
-   - Reads `usage` block from response; updates `daily_cap.spent_cents += actual_cost`; commits
-6. Response returned to browser
-
-### 5.3 Admin promotes test → prod
+### 4.3 Admin promotes test → prod
 
 1. Admin clicks "Promote" in portal
-2. Portal API route checks `role === 'Admin'`
-3. Portal calls ADO REST API: trigger `promote-meeting-agent` pipeline with parameter `image_tag=<sha>`
-4. Pipeline (WIF auth): `az containerapp update --image meeting-agent:<sha> --resource-group rg-vibecoding-pilot --name meeting-agent-prod`
-5. Pipeline writes audit row to portal DB: `(actor, action, target, image_tag, timestamp)` via temporary MI access
-6. Portal polls pipeline status; UI updates when revision is `Running`
+2. Portal `/promote` endpoint checks role = `Admin`
+3. Portal triggers ADO pipeline via REST API with parameter `image_digest=<sha256:…>`
+4. Pipeline (SP-secret auth) calls self-host registry to **retag** the existing image: `docker tag registry.../meeting-agent-proxy@sha256:abc registry.../meeting-agent-proxy:prod`
+5. Pipeline calls `az containerapp update --name meeting-agent-proxy-prod --image registry.../meeting-agent-proxy:prod`
+6. Pipeline writes audit row via short-lived DB connection
+7. Portal polls pipeline status; UI updates when prod revision is `Running`
 
 ---
 
-## 6. Postgres schema (Phase 1 minimum)
+## 5. Postgres schema layout (single server, multi-schema)
 
 ```sql
--- portal DB
-CREATE TABLE app_users (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  upn             TEXT NOT NULL UNIQUE,         -- e.g. j.polleunis@tag-team.be
-  display_name    TEXT NOT NULL,
-  role            TEXT NOT NULL CHECK (role IN ('Admin','Developer')),
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+-- Schema: portal
+CREATE TABLE portal.app_users (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sub           TEXT NOT NULL UNIQUE,       -- Keycloak subject claim
+  username      TEXT NOT NULL,
+  display_name  TEXT NOT NULL,
+  role          TEXT NOT NULL CHECK (role IN ('Admin','Developer')),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE apps (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name            TEXT NOT NULL UNIQUE,         -- e.g. meeting-agent
-  display_name    TEXT NOT NULL,
-  test_url        TEXT,                          -- ACA FQDN
-  prod_url        TEXT,
-  owner_upn       TEXT REFERENCES app_users(upn),
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE portal.apps (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          TEXT NOT NULL UNIQUE,
+  display_name  TEXT NOT NULL,
+  test_url      TEXT,
+  prod_url      TEXT,
+  owner_sub     TEXT REFERENCES portal.app_users(sub),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE audit_log (
-  id              BIGSERIAL PRIMARY KEY,
-  actor_upn       TEXT NOT NULL,
-  action          TEXT NOT NULL,                 -- 'role_change' | 'promote_test_to_prod' | …
-  target          TEXT NOT NULL,                 -- app name or user upn
-  metadata        JSONB,
-  occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE portal.audit_log (
+  id            BIGSERIAL PRIMARY KEY,
+  actor_sub     TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  target        TEXT NOT NULL,
+  metadata      JSONB,
+  occurred_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- App role: GRANT INSERT, SELECT ON audit_log TO portal_app_role; REVOKE UPDATE, DELETE.
+-- app role gets INSERT, SELECT only; UPDATE/DELETE revoked.
 
--- proxy_meeting_agent_{test,prod} DBs (one per env, blast-radius isolation)
+-- Schema: proxy_meeting_agent_{test,prod}
 CREATE TABLE daily_cap (
   day           DATE PRIMARY KEY,
   spent_cents   BIGINT NOT NULL DEFAULT 0
 );
 
-CREATE TABLE rate_limit (                       -- rate-limiter-flexible PG schema
+CREATE TABLE rate_limit (
   key           TEXT PRIMARY KEY,
   points        INT NOT NULL,
   expire        TIMESTAMPTZ NOT NULL
 );
 
-CREATE TABLE llm_calls (                        -- audit + reconciliation
+CREATE TABLE llm_calls (
   id            BIGSERIAL PRIMARY KEY,
-  user_upn      TEXT NOT NULL,
+  user_sub      TEXT NOT NULL,
   model         TEXT NOT NULL,
   input_tokens  INT NOT NULL,
   output_tokens INT NOT NULL,
@@ -238,167 +207,115 @@ CREATE TABLE llm_calls (                        -- audit + reconciliation
   cost_cents    INT NOT NULL,
   occurred_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Schema: keycloak -> populated/managed by Keycloak itself on first start.
 ```
 
-**Daily-cap transaction pattern:**
-
-```sql
-BEGIN;
-INSERT INTO daily_cap (day) VALUES (CURRENT_DATE) ON CONFLICT DO NOTHING;
-SELECT spent_cents FROM daily_cap WHERE day = CURRENT_DATE FOR UPDATE;
--- in app:
---   if spent_cents + 0.9 * cap_cents > cap_cents → ROLLBACK, return HTTP 429
---   else continue
-UPDATE daily_cap SET spent_cents = spent_cents + :actual_cost WHERE day = CURRENT_DATE;
-COMMIT;
-```
-
-The "90% safety margin" sub-cap (CRIT-2) absorbs race-condition slack from multiple replicas.
+Daily-cap transaction stays identical (see SUMMARY).
 
 ---
 
-## 7. Repo + CI/CD topology
-
-### 7.1 Monorepo layout
+## 6. Repo + CI/CD layout
 
 ```
 vibecoding-platform/
-├─ .planning/                 (PROJECT.md, ROADMAP.md, research/, …)
+├─ .planning/
 ├─ docs/
-│  ├─ architecture.md         (DOC-01)
-│  ├─ runbook.md              (DOC-02)
-│  ├─ onboarding.md           (DOC-03)
-│  └─ it-request.md           (DOC-04)
-├─ infra/                     (Bicep)
-│  ├─ main.bicep
+│  ├─ architecture.md
+│  ├─ runbook.md
+│  ├─ onboarding.md
+│  ├─ it-request.md
+│  └─ management.md
+├─ infra/
+│  ├─ main.bicep                  (single file, no AVM)
 │  ├─ main.bicepparam
-│  └─ modules/                (avm modules pinned)
+│  └─ keycloak/
+│     └─ realm-export.json
 ├─ apps/
-│  ├─ portal/                 (Next.js)
+│  ├─ portal/                     (Python FastAPI)
 │  │  ├─ Dockerfile
-│  │  └─ src/
+│  │  ├─ pyproject.toml
+│  │  ├─ src/
+│  │  └─ alembic/
 │  └─ meeting-agent/
-│     ├─ static/              (Nginx-served HTML, copied from Claude artifact)
-│     │  └─ Dockerfile
-│     └─ proxy/               (Node Express)
+│     ├─ static/                  (Nginx-served HTML)
+│     │  ├─ Dockerfile
+│     │  ├─ html/
+│     │  └─ oauth2-proxy.cfg
+│     └─ proxy/                   (Python FastAPI)
 │        ├─ Dockerfile
+│        ├─ pyproject.toml
 │        └─ src/
-├─ pipelines/                 (Azure DevOps YAML)
+├─ pipelines/                     (Azure DevOps YAML)
 │  ├─ portal.yml
 │  ├─ meeting-agent-static.yml
 │  ├─ meeting-agent-proxy.yml
 │  ├─ infra.yml
-│  └─ promote.yml             (manual-trigger promotion)
+│  ├─ keycloak-realm-sync.yml
+│  └─ promote.yml
 └─ README.md
 ```
 
-### 7.2 Pipeline pattern
+**Image promotion = retag in self-host registry**, no rebuild. Same digest → exact same bits.
 
-| Pipeline | Trigger | Stages |
-|----------|--------|--------|
-| `infra.yml` | path `infra/**` on main | bicep what-if → bicep deploy (RG-scope) → smoke test (RG exists, KV reachable) |
-| `portal.yml` | path `apps/portal/**` | install → typecheck → test → docker build → Trivy scan → push ACR → ACA update (revision suffix = git sha) → smoke test (302 to login.microsoftonline.com) |
-| `meeting-agent-static.yml` | path `apps/meeting-agent/static/**` | docker build (Nginx + assets) → Trivy → push → ACA update (test only) |
-| `meeting-agent-proxy.yml` | path `apps/meeting-agent/proxy/**` | install → test → docker → Trivy → push → ACA update (test only) → run `/healthz/secrets` |
-| `promote.yml` | manual trigger from portal (POST to ADO REST API with admin token) | retag image `test → prod` in ACR → ACA update on `-prod` app → audit-log row |
-
-**Image promotion pattern:** **retag the same digest**, do not rebuild. This guarantees prod = the bits that were tested. Tag scheme: `meeting-agent:<git-sha>` (immutable) + `meeting-agent:test-latest` + `meeting-agent:prod-latest` (mutable aliases for ops convenience).
-
-**WIF setup:**
-- One user-assigned managed identity per environment: `mi-vibecoding-pilot` (shared dev+pilot in Phase 1).
-- Federated credential subject claim format: `sc://<org>/<project>/<service-connection-name>` — verified post-create with `az identity federated-credential show`.
-- RBAC: Contributor on the RG only (not subscription) — MIN-5.
+**SP-secret service connection**: rotate every 90 days; rotation procedure in runbook.
 
 ---
 
-## 8. Test/Prod separation (decision recap)
+## 7. Test/Prod separation
 
-**Chosen: single Container Apps Environment, suffix-naming.** Rationale:
-
-- Two Container Apps per app: `meeting-agent-test` + `meeting-agent-prod`, both in `cae-vibecoding-pilot`.
-- Resource-limits per app match the table from PROJECT.md (test 0.5 vCPU / 1 GiB / scale-to-zero / max 1; prod 2 vCPU / 4 GiB / `minReplicas: 1` / max 5 / CPU>70% scale).
-- Single Postgres server; **two logical DBs** per stateful app (`proxy_meeting_agent_test`, `proxy_meeting_agent_prod`) so test data and prod data don't share tables.
-- Single Key Vault but **two secret names per pair**: `claude-api-key--test` and `claude-api-key--prod`.
-- Single LAW; logs filtered by Container App name in Kusto queries.
-
-**Trade-off accepted:** ACA Environment = same VNET = no network isolation between test and prod. Acceptable for pilot. Migration to two-env in Phase 2 if Postgres or compliance requires it (Bicep change of ~30 lines).
+Same as before: **single Container Apps Environment, suffix-naming** (`meeting-agent-test`, `meeting-agent-prod`, etc.). One Postgres server with logical schemas per env (`proxy_meeting_agent_test`, `proxy_meeting_agent_prod`). One Keycloak instance shared (single realm `vibecoding`); roles + clients in one realm.
 
 ---
 
-## 9. Suggested build order (Phase 1)
+## 8. Suggested build order (Phase 1)
 
-Derived from the dependency graph:
-
-| Order | Topic | Outputs | Unblocks |
-|-------|-------|---------|----------|
-| **1.** | Bicep skeleton + RG bootstrap | RG, KV (empty), Log Analytics, App Insights, ACR, ACA Env | All container deploys |
-| **2.** | Entra app-registration + WIF service connection | App-reg, federated credential, RBAC on RG | CI/CD + Easy Auth + Auth.js |
-| **3.** | Postgres Flex + pgbouncer + initial schema | DB up, schemas migrated, MI granted | Portal + proxy data layer |
-| **4.** | Portal stub (login only) + Easy Auth on a dummy ACA app | SSO validated end-to-end before real app code | All other apps trust the auth contract |
-| **5a + 5b (parallel)** | Portal real features (dashboard, admin, audit view) **AND** LLM-proxy + daily-cap implementation | Portal usable; proxy callable | "Live" pilot |
-| **6.** | Meeting Agent static (Nginx) + integration with proxy | Pilot app actually works | UAT |
-| **7.** | All pipelines wired in ADO (path-triggered) + Trivy + smoke tests | Push-to-deploy + image-scan gate | Phase-completion |
-| **8.** | Documentation: architecture, runbook, onboarding, IT-request | DOC-01..05 | Phase done |
-| **9.** | Promote-test→prod pipeline + portal trigger + audit | Promotion flow E2E | Production handover to TAG |
-
-Steps 5a + 5b are explicitly parallel — they share no code (portal = Next.js, proxy = Node Express) and only meet at the Postgres schema (defined in step 3). Two developers, one each.
+| Order | Topic | Outputs |
+|-------|-------|---------|
+| 1 | Bicep skeleton + RG | RG, Storage Account + Files shares, LAW, ACA Env |
+| 2 | Self-host registry + oauth2-proxy + Keycloak realm-export checked-in | Registry callable + Keycloak running |
+| 3 | Self-host Postgres deployed; pg_dump-job scheduled; restore-drill validated | DB online + backup tested |
+| 4 | Portal stub (login-only) wired to Keycloak via Authlib | E2E SSO contract validated |
+| 5a + 5b (parallel) | Portal real features (dashboard, admin, audit) **AND** LLM-proxy + daily-cap | Pilot live |
+| 6 | Meeting Agent static + oauth2-proxy sidecar | Pilot E2E |
+| 7 | All ADO pipelines path-triggered + Trivy + smoke tests | Push-to-deploy |
+| 8 | Docs (DOC-01..06) | Phase done |
+| 9 | Promote pipeline + portal trigger + audit | Production handover |
 
 ---
 
-## 10. Onboarding a new app
+## 9. Networking
 
-**Phase 1 — manual (admin only):**
-1. Admin creates `apps/<new-app>/` folder in monorepo with `Dockerfile` + ACA Bicep snippet.
-2. Admin adds row in portal DB `apps` table with name + owner.
-3. Admin runs `infra.yml` pipeline to deploy the new Container App (`-test` and `-prod`).
-4. Admin assigns Easy Auth → same Entra app-reg → same Admin/Developer roles automatically apply.
-5. Admin pushes initial image via the new path-triggered pipeline.
-6. App appears in portal dashboard (auto-discovered from DB).
-
-**Phase 2 — self-service (future, NOT in Phase 1 scope):**
-- Developer pushes to a per-app branch with a template repo.
-- Portal "Add app" wizard creates DB row + triggers Bicep + creates pipeline (Bicep-from-Bicep loop).
-- Approval gate (admin review) before first prod deploy.
+Public ingress, no VNET (same rationale as before: all traffic gated by Keycloak OIDC).
 
 ---
 
-## 11. Networking
+## 10. Observability minimum
 
-**Public ingress, no VNET** — Phase 1 only. Acceptable because:
-- All apps require AAD SSO (no anonymous traffic).
-- ACA default HTTPS termination is fine.
-- VNET-integration adds ~€60/month minimum + complexity not justified by pilot threat model.
+| Signal | Source | Alert |
+|--------|--------|-------|
+| Failed requests | structlog JSON in LAW (KQL `where status >= 500`) | > 5% over 5 min |
+| Daily cap warn | proxy emits `spent_cents` metric to stdout | spent > 80% of cap |
+| LAW ingest cost | Azure Cost Mgmt | budget alert €15 + €30 |
+| Postgres CPU/mem | ACA built-in metrics | CPU > 80% sustained 10 min |
+| Replica restart loop | LAW Kusto on system logs | > 3 restarts in 10 min |
+| pg_dump-job last success | last `audit_log` row from job | > 36h since last success |
 
-**Phase 2+ considerations:** if any pilot app handles client-confidential data, move ACA Env to VNET-integrated mode + Private Endpoints for Postgres & KV (~€100/month extra).
-
----
-
-## 12. Observability minimum (Phase 1)
-
-| Signal | Tool | Alert rule |
-|--------|------|------------|
-| Failed request rate (portal + proxy) | App Insights | > 5% over 5 min |
-| Daily cap warn | Custom metric from proxy | spent_cents > 80% of cap |
-| LAW ingest cost | Cost Management | budget alert at €50 + €100 |
-| Postgres CPU credits | Azure Monitor | `cpu_credit_balance` < 200 |
-| ACA replica restart loop | LAW Kusto on `ContainerAppSystemLogs` | > 3 restarts in 10 min |
-| Cert expiry (only relevant once custom domain exists) | Azure Monitor | < 14 days |
-
-Dashboards: one App Insights workbook per env + one cost-overview pinned to Azure Portal home.
+Dashboards: one Azure Workbook on the LAW, one cost-overview pinned to Azure Portal home.
 
 ---
 
-## 13. Decisions locked here
+## 11. Decisions locked here
 
 | # | Decision | Rationale |
-|---|---------|-----------|
-| A1 | Single Container Apps Environment, suffix-naming for test/prod | Cheapest, simplest for pilot; isolation via app-level resource limits |
-| A2 | Single Entra app-registration, app-roles `Admin` + `Developer` | One consent screen, one source of role definitions |
-| A3 | Source of truth for user roles = Postgres `app_users`, seeded from Entra app-roles claim on first login | Allows TAG IT to manage roles in either Entra or via portal-admin; deferred decision to Phase 2 |
-| A4 | Easy Auth for pilot static + proxy; Auth.js v5 for portal | Easy Auth = zero-code SSO for surfaces without per-user state; Auth.js for stateful UI |
-| A5 | Daily cap counter = Postgres-backed with `SELECT … FOR UPDATE` + 90% safety margin | Survives container restarts and multi-replica races |
-| A6 | Promote = ACR retag (same digest), not rebuild | Production runs the exact bits tested in test |
-| A7 | Monorepo + path-triggered ADO pipelines | One repo for 2 devs; per-app pipelines triggered only when that app changes |
-| A8 | WIF for ADO→Azure; no long-lived SP secrets | Microsoft default 2026; no secret rotation burden |
-| A9 | Public ingress, no VNET in Phase 1 | Threat-model accepts public surface protected by AAD; defer VNET to Phase 2 if needed |
-| A10 | Application Insights workspace-based, sampled (20% dev, 5% proxy prod) | Cost containment within €100 budget |
+|---|----------|-----------|
+| A1 | Single ACA Env, suffix-naming for test/prod | Cheapest, simplest |
+| A2 | Single Keycloak realm `vibecoding`, two clients (`portal`, `meeting-agent-proxy`) | One source of role definitions |
+| A3 | Source of truth for roles = Postgres `portal.app_users` (seeded from Keycloak role-claim) | TAG-admin can manage in either side |
+| A4 | `oauth2-proxy` sidecar for static + registry; Authlib in portal + proxy | Sidecar pattern keeps Nginx + distribution images unchanged |
+| A5 | Daily-cap = Postgres `SELECT … FOR UPDATE` + 90% margin | Race-safe |
+| A6 | Promote = retag in self-host registry | Production runs the bits tested |
+| A7 | Monorepo + path-triggered ADO pipelines | Same as before |
+| A8 | SP-secret service connection, 90d rotation | Matches self-host strategy; no WIF |
+| A9 | Public ingress, no VNET | Threat-model accepts |
+| A10 | structlog JSON to ACA stdout, no App Insights | Cost-zero observability |
